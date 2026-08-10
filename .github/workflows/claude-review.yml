@@ -1,0 +1,124 @@
+# AUTO-SYNCED from the LLM Builder Kit. Do not edit here; edit the kit source and re-run sync-standards.ps1.
+
+# Claude code review. Posts a review comment on every PR.
+#
+# A repo gets this file two ways: operator-tools/Bootstrap-Repo.ps1 at onboarding,
+# or by naming claude-review in docs/standards/.standards-include, which puts it
+# on the same drift check as every other vendored standard.
+#
+# Needs ANTHROPIC_API_KEY, as an organization secret visible to the repo or a repo
+# secret. Bootstrap-Repo / Sync-Secrets sets the repo form; a repo that opted in
+# later has to be granted the key, and the first step here fails loudly until it
+# is. Fork PRs get no secret access.
+name: Claude code review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      review_scope:
+        description: "Review scope: diff or full codebase"
+        required: false
+        default: "diff"
+        type: choice
+        options:
+          - diff
+          - full
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Claude code review
+    runs-on: ubuntu-latest
+    # Only run with secrets for same-repo PRs; fork PRs never see the key.
+    if: github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_REVIEW_MODEL: ${{ vars.CLAUDE_REVIEW_MODEL || 'claude-sonnet-5' }}
+      REVIEW_PROJECT_NAME: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      REVIEW_SCOPE: ${{ github.event.inputs.review_scope || 'diff' }}
+    steps:
+      # The key is checked FIRST, and its absence is red.
+      #
+      # Without it the reviewer wrote "Skipped: ANTHROPIC_API_KEY is not
+      # configured" and exited zero, so the PR showed a green "Claude code
+      # review" check next to a review that never happened. A check that
+      # reports success while skipping is worse than one that fails: the green
+      # is what gets trusted, and review-standards.md feeds the auto-merge
+      # verdict. Two repos ran in exactly that state.
+      #
+      # Same reason this is a step and not an `if:` on the job: a skipped job
+      # also reports as not-failed.
+      - name: Require the review key
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY}" ]; then
+            echo "::error::ANTHROPIC_API_KEY is not set for ${GITHUB_REPOSITORY}, so no review ran." \
+                 "Set it as an organization secret (visible to this repo) or a repo secret," \
+                 "or remove claude-review from docs/standards/.standards-include to stop asking for it."
+            {
+              echo "## Claude Code Review"
+              echo
+              echo "No review ran: \`ANTHROPIC_API_KEY\` is not configured for this repository."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Review with Claude
+        run: python .github/scripts/claude_review.py
+
+      - name: Print Claude review
+        if: always()
+        run: |
+          if [ -s claude-review.md ]; then
+            cat claude-review.md
+          else
+            echo "Claude review did not produce output."
+          fi
+
+      - name: Upload Claude review artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-review-${{ github.run_id }}
+          path: claude-review.md
+          if-no-files-found: ignore
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request_target'
+        run: |
+          if [ -s claude-review.md ]; then
+            if ! gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+              -f body="$(cat claude-review.md)"; then
+              echo "Failed to post Claude review as a PR comment; see job summary." >&2
+            fi
+          fi
+
+      - name: Write job summary
+        if: always()
+        run: |
+          if [ -s claude-review.md ]; then
+            cat claude-review.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Claude review did not produce output." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
