@@ -31,7 +31,7 @@ move.
 For Claude Code, clone into your skills directory:
 
 ```bash
-git clone https://github.com/GestaltWorks/claude-cert-examprep.git ~/.claude/skills/claude-cert-examprep-coach
+git clone https://github.com/WorkflowtechAI/claude-cert-examprep.git ~/.claude/skills/claude-cert-examprep-coach
 ```
 
 For a claude.ai Project, paste the contents of `SKILL.md` into the project instructions
