@@ -145,6 +145,7 @@ plan to leave. Full doctrine and tooling: the **doc-discipline** skill.
 - Commit only intentional source changes.
 - Do not include build output, dependency folders, secrets, local databases, or personal machine paths.
 - **Merged to main/master == prod == live.** The live event is the merge to the main branch, not a push to a feature/dev branch. Directed or approved work ships end to end: branch, PR, merge to main, deploy. Merging a directed task to main is the intended outcome, not an action to pause on. Feature and dev branches are dev — push them freely.
+- **Release policy: CI green = merge = deploy.** A PR whose required checks pass is cleared to merge, and the merge is cleared to deploy, without a separate approval round. Copy review and stakeholder feedback happen after ship, not as gates before it. This is the written release policy repo working rules may reference; the irreversible tier below remains the only stop.
 - Stop only for the irreversible tier — production data deletion or destructive migration, secret rotation or exposure, payment/billing changes, force-push over shared history, mass external outreach. For those, raise a decision the operator reviews and accepts, rather than acting silently; keep working the rest of the task meanwhile.
 - A deployment is complete only when the live service is updated and a smoke check passes.
 - Know the rollback path before risky releases.
