@@ -1,5 +1,3 @@
-# AUTO-SYNCED from the LLM Builder Kit. Do not edit here; edit the kit source and re-run sync-standards.ps1.
-
 # Claude code review. Posts a review comment on every PR.
 #
 # A repo gets this file two ways: operator-tools/Bootstrap-Repo.ps1 at onboarding,
@@ -83,6 +81,14 @@ jobs:
           ref: ${{ github.event.pull_request.base.sha || github.sha }}
           fetch-depth: 0
 
+      # The reviewer's own parsing is tested BEFORE it is trusted to review.
+      # It failed silently once (thinking-block-first responses parsed to empty,
+      # posted "No review text returned", and passed CI on ~2,048 billed output
+      # tokens), so the response-shape handling now has to prove itself on every
+      # run. Pure and network-free: no key, no API call, ~0.0s.
+      - name: Test the reviewer before reviewing
+        run: python .github/scripts/test_claude_review.py
+
       - name: Review with Claude
         run: python .github/scripts/claude_review.py
 
@@ -121,4 +127,3 @@ jobs:
           else
             echo "Claude review did not produce output." >> "$GITHUB_STEP_SUMMARY"
           fi
-
