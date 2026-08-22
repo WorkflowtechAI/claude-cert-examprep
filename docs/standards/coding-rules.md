@@ -1,4 +1,8 @@
+---
+kind: durable
+---
 <!-- AUTO-SYNCED from the LLM Builder Kit. Do not edit here; edit the kit source and re-run sync-standards.ps1. -->
+
 
 # Professional Coding Rules for a One-Person Software Shop
 
@@ -250,4 +254,3 @@ not the list.
 - Copy should be specific, useful, and credible. Avoid generic SaaS filler.
 - Favor accessible UI, clear errors, fast paths, and obvious next actions.
 - Every shipped feature should have an owner, purpose, and maintenance path.
-

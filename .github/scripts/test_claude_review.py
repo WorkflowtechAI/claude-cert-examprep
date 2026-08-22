@@ -1,3 +1,6 @@
+# AUTO-SYNCED from the LLM Builder Kit. Do not edit here; edit the kit
+# source and re-run sync-standards.ps1.
+
 """Tests for the review-response parsing in claude_review.py.
 
 WHY THIS FILE EXISTS. The parsing it covers failed silently in production:
@@ -12,9 +15,11 @@ Pure: no network, no API key, no subprocess. Run with `python -m unittest
 discover .github/scripts` or `python .github/scripts/test_claude_review.py`.
 """
 
+import importlib.util
+import os
 import unittest
 from pathlib import Path
-import importlib.util
+from unittest import mock
 
 _spec = importlib.util.spec_from_file_location(
     "claude_review", Path(__file__).with_name("claude_review.py")
@@ -142,6 +147,150 @@ class TruncationIsFlagged(unittest.TestCase):
             "stop_reason": "end_turn",
         }
         self.assertNotIn("Truncated", review_text_from_body(body))
+
+
+class StatusDecidesTheCheckColour(unittest.TestCase):
+    """The banner informs a human; the STATUS decides whether CI goes green.
+
+    A review that stopped at the ceiling verified an unknown fraction of the
+    diff. It used to pass anyway: the PR #32 review spent all 8,192 output
+    tokens on reasoning, emitted the words "This diff", billed $0.15, and went
+    green. Same rule the missing-key step already enforces at the top of the
+    job.
+    """
+
+    def test_a_truncated_review_is_not_ok(self):
+        text = review_text_from_body({
+            "content": [{"type": "text", "text": "## Summary\n\nThis diff"}],
+            "stop_reason": "max_tokens",
+        })
+        self.assertEqual(claude_review.review_status(text), claude_review.STATUS_TRUNCATED)
+
+    def test_an_empty_review_is_not_ok(self):
+        text = review_text_from_body({"content": [{"type": "thinking"}], "stop_reason": "end_turn"})
+        self.assertEqual(claude_review.review_status(text), claude_review.STATUS_EMPTY)
+
+    def test_a_complete_review_is_ok(self):
+        text = review_text_from_body({
+            "content": [{"type": "text", "text": "Finding one. Finding two."}],
+            "stop_reason": "end_turn",
+        })
+        self.assertEqual(claude_review.review_status(text), claude_review.STATUS_OK)
+
+    def test_a_review_that_merely_mentions_truncation_is_still_ok(self):
+        # The classifier keys on the banner this script writes at the START of
+        # the body, not on the word appearing anywhere. A review discussing a
+        # truncation bug in the diff under review must not fail the build.
+        text = review_text_from_body({
+            "content": [{"type": "text", "text": "The snapshot is Truncated here, which is fine."}],
+            "stop_reason": "end_turn",
+        })
+        self.assertEqual(claude_review.review_status(text), claude_review.STATUS_OK)
+
+    def test_the_ceiling_leaves_room_for_reasoning_before_the_answer(self):
+        # 8192 covered thinking AND the answer, and thinking is not bounded by
+        # "be concise", so the answer was the part that got cut. Pinning the
+        # floor so a future trim has to argue with this comment.
+        self.assertGreaterEqual(claude_review.DEFAULT_CLAUDE_REVIEW_MAX_TOKENS, 16000)
+
+
+class FileSelectionTreatsRootLikeNested(unittest.TestCase):
+    """The exclude list is written as `**/dist/**`, and fnmatch has no `**`.
+
+    Its `*` does match `/`, so the pattern reads as `*/dist/*` and needs a slash
+    BEFORE `dist`. A nested path has one; a root-level path does not. Measured
+    before the fix: `web/package-lock.json` excluded, `package-lock.json`
+    reviewed, and the same for node_modules, dist, vendor, .venv and *.min.js.
+    A root lockfile is the common case, and it went to the model in every PR
+    that touched it.
+    """
+
+    def test_root_level_build_artifacts_are_excluded_like_nested_ones(self):
+        for path in (
+            "package-lock.json", "web/package-lock.json",
+            "pnpm-lock.yaml", "uv.lock",
+            "node_modules/x/index.js", "web/node_modules/x/index.js",
+            "dist/bundle.js", "web/dist/bundle.js",
+            "vendor/lib.py", ".venv/lib/site.py",
+            "app.min.js", "static/app.min.js",
+        ):
+            with self.subTest(path=path):
+                self.assertFalse(claude_review.include_file(path), path)
+
+    def test_source_is_reviewed_at_every_depth(self):
+        for path in (
+            "app.py", "src/a/b/c.py", "web/src/index.tsx",
+            ".github/workflows/ci.yml", "README.md",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(claude_review.include_file(path), path)
+
+
+class RedactionLeavesActionsExpressionsAlone(unittest.TestCase):
+    """`${{ secrets.X }}` names a secret; it does not contain one.
+
+    The redactor rewrote `ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}`
+    into `ANTHROPIC_API_KEY=<REDACTED> secrets.ANTHROPIC_API_KEY }}` before the
+    model saw the diff, and the model then reported the workflow as broken
+    YAML, as a blocking finding, on a line that was fine.
+    """
+
+    def test_a_workflow_secret_reference_survives(self):
+        line = "      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}"
+        self.assertEqual(claude_review.redact(line), line)
+
+    def test_a_real_value_is_still_redacted(self):
+        self.assertEqual(
+            claude_review.redact("api_key = sk_live_abc123def456"),
+            "api_key=<REDACTED>",
+        )
+        self.assertNotIn("hunter2", claude_review.redact("password: hunter2"))
+
+    def test_a_quoted_value_is_redacted_too(self):
+        # The value class excluded the opening quote, so `password: "abc123"`
+        # never matched and went to the model as written.
+        cases = {
+            'password: "hunter2"': "password=<REDACTED>",
+            "api_key='sk_live_abc123'": "api_key=<REDACTED>",
+            'TOKEN = "abc123"': "TOKEN=<REDACTED>",
+        }
+        for line, want in cases.items():
+            with self.subTest(line=line):
+                # Exact, so a dangling closing quote fails here too: an
+                # unbalanced quote is the kind of artifact the model then
+                # reads as broken syntax.
+                self.assertEqual(claude_review.redact(line), want)
+
+
+class TheCeilingComesFromTheEnvironment(unittest.TestCase):
+    """The workflow always sets CLAUDE_REVIEW_MAX_TOKENS now, from a repository
+    variable that is usually unset. So the value the script usually sees is the
+    EMPTY STRING, not an absent key, and that has to mean the default."""
+
+    DEFAULT = claude_review.DEFAULT_CLAUDE_REVIEW_MAX_TOKENS
+
+    def test_empty_string_means_the_default(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_REVIEW_MAX_TOKENS": ""}):
+            self.assertEqual(claude_review.max_tokens_from_env(), self.DEFAULT)
+
+    def test_unset_means_the_default(self):
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_REVIEW_MAX_TOKENS"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(claude_review.max_tokens_from_env(), self.DEFAULT)
+
+    def test_a_repo_value_wins(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_REVIEW_MAX_TOKENS": " 24000 "}):
+            self.assertEqual(claude_review.max_tokens_from_env(), 24000)
+
+    def test_a_typo_costs_the_tuning_not_the_review(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_REVIEW_MAX_TOKENS": "lots"}):
+            self.assertEqual(claude_review.max_tokens_from_env(), self.DEFAULT)
+
+    def test_zero_and_negatives_are_typos_too(self):
+        for bad in ("0", "-5"):
+            with self.subTest(value=bad):
+                with mock.patch.dict(os.environ, {"CLAUDE_REVIEW_MAX_TOKENS": bad}):
+                    self.assertEqual(claude_review.max_tokens_from_env(), self.DEFAULT)
 
 
 if __name__ == "__main__":
