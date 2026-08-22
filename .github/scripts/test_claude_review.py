@@ -15,8 +15,11 @@ Pure: no network, no API key, no subprocess. Run with `python -m unittest
 discover .github/scripts` or `python .github/scripts/test_claude_review.py`.
 """
 
+import contextlib
 import importlib.util
+import io
 import os
+import re
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -194,6 +197,62 @@ class StatusDecidesTheCheckColour(unittest.TestCase):
         self.assertGreaterEqual(claude_review.DEFAULT_CLAUDE_REVIEW_MAX_TOKENS, 16000)
 
 
+class TheCheckoutFollowsTheBaseBranch(unittest.TestCase):
+    """The workflow checks out the base BRANCH, not the base SHA in the event.
+
+    `github.event.pull_request.base.sha` is the base tip as it stood when the
+    PR was opened, and GitHub does not refresh it when the base moves. So a fix
+    merged after a PR was opened never reached that PR's reviews: one managed
+    repo had a PR opened against the 8192-token reviewer, master moved to the
+    32000-token one, and every run AND re-run on that PR still checked out the
+    old script and died on max_tokens. Rebasing was the only way in. A branch
+    name is resolved when the job runs.
+
+    Still the trusted side of pull_request_target: the base branch is history
+    that only push access can change, and fork PRs never reach the job.
+    Checking out head.sha with secrets in the environment is the thing that
+    must never happen, so that is pinned here as well.
+    """
+
+    @staticmethod
+    def _workflow():
+        here = Path(__file__).resolve()
+        # Deployed, the test sits in .github/scripts/ beside .github/workflows/.
+        # In the kit's template directory the two files are siblings.
+        for candidate in (
+            here.parents[1] / "workflows" / "claude-review.yml",
+            here.with_name("claude-review.yml"),
+        ):
+            if candidate.is_file():
+                return candidate.read_text(encoding="utf-8")
+        return None
+
+    def setUp(self):
+        workflow = self._workflow()
+        if workflow is None:
+            self.fail(
+                "claude-review.yml was not found beside this test. The workflow and "
+                "this file ship together (standards-map.ps1, Bootstrap-Repo.ps1)."
+            )
+        refs = re.findall(r"^\s*ref:\s*(\S.*?)\s*$", workflow, flags=re.M)
+        self.assertEqual(len(refs), 1, f"expected exactly one checkout ref:, found {refs}")
+        self.ref = refs[0]
+
+    def test_the_ref_is_the_base_branch_resolved_when_the_job_runs(self):
+        self.assertIn("github.event.pull_request.base.ref", self.ref, self.ref)
+
+    def test_the_ref_is_not_the_sha_frozen_when_the_pr_was_opened(self):
+        self.assertNotIn("base.sha", self.ref, self.ref)
+
+    def test_the_ref_is_never_the_pull_request_head(self):
+        for untrusted in ("head.sha", "head.ref", "head_ref", "merge_commit_sha"):
+            with self.subTest(untrusted=untrusted):
+                self.assertNotIn(untrusted, self.ref, self.ref)
+
+    def test_workflow_dispatch_still_falls_back_to_the_dispatched_sha(self):
+        self.assertIn("github.sha", self.ref, self.ref)
+
+
 class FileSelectionTreatsRootLikeNested(unittest.TestCase):
     """The exclude list is written as `**/dist/**`, and fnmatch has no `**`.
 
@@ -271,6 +330,59 @@ class RedactionLeavesActionsExpressionsAlone(unittest.TestCase):
                 # reads as broken syntax.
                 self.assertEqual(claude_review.redact(line), want)
 
+    def test_a_json_quoted_key_is_redacted_too(self):
+        # A JSON key carries its closing quote between the name and the colon,
+        # so `"password": "hunter2"` never matched: `\s*[:=]` had to follow the
+        # name directly, and the value went to the model as written. Verified
+        # with a probe on 2026-08-22.
+        cases = {
+            '{"password": "hunter2", "user": "bob"}': '{"password=<REDACTED>, "user": "bob"}',
+            '{"api_key":"sk_live_abc123"}': '{"api_key=<REDACTED>}',
+            # A Python dict quotes the same way, with the other quote.
+            "{'client_secret': 'abc123'}": "{'client_secret=<REDACTED>}",
+            # The common JSON shape is a longer key that ENDS in a secret name.
+            '"db_password": "correct horse battery"': '"db_password=<REDACTED>',
+        }
+        for line, want in cases.items():
+            with self.subTest(line=line):
+                self.assertEqual(claude_review.redact(line), want)
+
+    def test_a_json_quoted_expression_survives(self):
+        # The same key shape naming a workflow secret still contains no value.
+        line = '{"TOKEN": "${{ secrets.TOKEN }}"}'
+        self.assertEqual(claude_review.redact(line), line)
+
+    def test_a_quoted_name_that_ends_its_line_is_code(self):
+        # `if kind == "token":` ends a line; the value of a JSON key never does.
+        # Spanning the line break here ate the next line's first word and would
+        # hand the model a hunk that does not parse.
+        line = 'if kind == "token":\n    return x'
+        self.assertEqual(claude_review.redact(line), line)
+        # The unquoted form still spans it: YAML allows the scalar on the next line.
+        self.assertNotIn("hunter2", claude_review.redact("password:\n  hunter2"))
+
+    def test_a_comparison_is_code_not_an_assignment(self):
+        # `==` and `===` compare. Only the first `=` used to match, and the rest
+        # of the line was taken as the value. Quoted or bare, the line survives.
+        for line in (
+            "if password == other_var:",
+            'if "password" == other_var:',
+            "if (token === expected) {",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(claude_review.redact(line), line)
+
+    def test_the_other_assignment_shapes_are_redacted_too(self):
+        cases = {
+            # PHP array: the same closing-quote gap as a JSON key.
+            "'password' => 'hunter2',": "'password=<REDACTED>,",
+            # Python walrus: `:=` is one separator, not a colon and a stray `=`.
+            'if (password := "hunter2"):': "if (password=<REDACTED>):",
+        }
+        for line, want in cases.items():
+            with self.subTest(line=line):
+                self.assertEqual(claude_review.redact(line), want)
+
 
 class TheCeilingComesFromTheEnvironment(unittest.TestCase):
     """The workflow always sets CLAUDE_REVIEW_MAX_TOKENS now, from a repository
@@ -279,9 +391,17 @@ class TheCeilingComesFromTheEnvironment(unittest.TestCase):
 
     DEFAULT = claude_review.DEFAULT_CLAUDE_REVIEW_MAX_TOKENS
 
+    @staticmethod
+    def _ceiling(value):
+        """max_tokens_from_env() with the variable set to `value`, stderr captured."""
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"CLAUDE_REVIEW_MAX_TOKENS": value}):
+            with contextlib.redirect_stderr(err):
+                got = claude_review.max_tokens_from_env()
+        return got, err.getvalue()
+
     def test_empty_string_means_the_default(self):
-        with mock.patch.dict(os.environ, {"CLAUDE_REVIEW_MAX_TOKENS": ""}):
-            self.assertEqual(claude_review.max_tokens_from_env(), self.DEFAULT)
+        self.assertEqual(self._ceiling("")[0], self.DEFAULT)
 
     def test_unset_means_the_default(self):
         env = {k: v for k, v in os.environ.items() if k != "CLAUDE_REVIEW_MAX_TOKENS"}
@@ -289,18 +409,34 @@ class TheCeilingComesFromTheEnvironment(unittest.TestCase):
             self.assertEqual(claude_review.max_tokens_from_env(), self.DEFAULT)
 
     def test_a_repo_value_wins(self):
-        with mock.patch.dict(os.environ, {"CLAUDE_REVIEW_MAX_TOKENS": " 24000 "}):
-            self.assertEqual(claude_review.max_tokens_from_env(), 24000)
+        self.assertEqual(self._ceiling(" 24000 ")[0], 24000)
 
     def test_a_typo_costs_the_tuning_not_the_review(self):
-        with mock.patch.dict(os.environ, {"CLAUDE_REVIEW_MAX_TOKENS": "lots"}):
-            self.assertEqual(claude_review.max_tokens_from_env(), self.DEFAULT)
+        self.assertEqual(self._ceiling("lots")[0], self.DEFAULT)
 
     def test_zero_and_negatives_are_typos_too(self):
         for bad in ("0", "-5"):
             with self.subTest(value=bad):
-                with mock.patch.dict(os.environ, {"CLAUDE_REVIEW_MAX_TOKENS": bad}):
-                    self.assertEqual(claude_review.max_tokens_from_env(), self.DEFAULT)
+                self.assertEqual(self._ceiling(bad)[0], self.DEFAULT)
+
+    def test_a_typo_is_said_out_loud(self):
+        # The fallback is the right outcome. A SILENT fallback would leave a
+        # mistyped repository variable unnoticed for as long as nobody read the
+        # job log closely, so it is a workflow warning, which the Actions UI
+        # surfaces as an annotation on the run.
+        for bad in ("lots", "0", "-5"):
+            with self.subTest(value=bad):
+                _, err = self._ceiling(bad)
+                self.assertIn("::warning::", err)
+                self.assertIn(bad, err)
+                self.assertIn(str(self.DEFAULT), err)
+
+    def test_the_normal_paths_are_quiet(self):
+        # Empty is the usual value and a valid number is a deliberate one.
+        # Neither is a warning, or every run would carry one.
+        for fine in ("", " 24000 "):
+            with self.subTest(value=fine):
+                self.assertEqual(self._ceiling(fine)[1], "")
 
 
 if __name__ == "__main__":

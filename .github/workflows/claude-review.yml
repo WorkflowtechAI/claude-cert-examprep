@@ -38,7 +38,7 @@ concurrency:
 jobs:
   review:
     name: Claude code review
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     # Only run with secrets for same-repo PRs; fork PRs never see the key.
     if: github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository
     env:
@@ -82,10 +82,34 @@ jobs:
             exit 1
           fi
 
+      # Check out the base BRANCH, not the base SHA the event payload carries.
+      #
+      # `github.event.pull_request.base.sha` is the base tip as it stood when
+      # the PR was opened, and GitHub does not refresh it when the base moves.
+      # So a fix merged to the base after a PR was opened never reached that
+      # PR's reviews. Measured on one managed repo: a PR opened against the
+      # 8192-token reviewer stayed on it through every run AND re-run after
+      # master had moved to the 32000-token one, the checkout step logged the
+      # stale ref each time, and each review died on max_tokens. Rebasing the
+      # PR was the only way the fix could reach it. A branch name is resolved
+      # when the job runs, so it is whatever the base is NOW, re-runs included.
+      #
+      # This is still the trusted side of pull_request_target. The base branch
+      # is repository history that only push access can change, and nothing
+      # from the PR reaches this ref: its author picks the base from branches
+      # that already exist here, and fork PRs never enter the job (the `if:`
+      # above). What must never happen is checking out head.sha with secrets in
+      # the environment, and that is unchanged. The diff under review comes
+      # from the GitHub API by PR number, not from this checkout, so which
+      # base commit is on disk does not change WHAT gets reviewed; it changes
+      # which reviewer does the reviewing.
+      #
+      # workflow_dispatch has no pull request, so it falls back to the sha of
+      # the ref it was dispatched on, as before.
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          ref: ${{ github.event.pull_request.base.ref || github.sha }}
           fetch-depth: 0
 
       # The reviewer's own parsing is tested BEFORE it is trusted to review.

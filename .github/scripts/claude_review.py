@@ -68,10 +68,29 @@ SECRET_PATTERNS = [
     # word. A quoted EXPRESSION is left alone like an unquoted one, since
     # `"${{ secrets.X }}"` is ordinary YAML quoting. An unterminated quote
     # falls back to the bare-token form.
+    #
+    # A JSON key carries its closing quote between the name and the colon, so
+    # `"password": "hunter2"` never matched: `\s*[:=]` had to follow the name
+    # directly, and the whole value went to the model as written (verified with
+    # a probe on 2026-08-22). A quote after the name (group 2) admits the JSON
+    # and Python-dict forms; the value branch already runs to the closing quote,
+    # and the name is not anchored, so `"db_password"`, the common JSON shape of
+    # a longer key that ENDS in a secret name, matches the same way. In that
+    # form the value has to sit on the key's line, which the conditional on
+    # group 2 enforces: a JSON value always does, and `if kind == "token":`
+    # followed by a line of code is code, not a secret. The unquoted form keeps
+    # spanning the line break, since YAML allows `password:` with its scalar on
+    # the next line.
+    #
+    # The separator is `:`, `=`, `:=` (walrus) or `=>` (PHP array), and never
+    # the first character of `==` or `===`: `password == other` is a comparison,
+    # and matching its first `=` redacted the second and left the line unable
+    # to parse. `'password' => 'hunter2'` used to slip through the same gap as
+    # the JSON key.
     (
         re.compile(
-            r"(?i)(api[_-]?key|token|secret|password|passwd|client[_-]?secret)"
-            r"\s*[:=]\s*"
+            r"(?i)(api[_-]?key|token|secret|password|passwd|client[_-]?secret)([\"'])?"
+            r"\s*(?:=>|:=|[:=](?!=))(?(2)[ \t]*|\s*)"
             r"(?:\"(?!\$\{\{)[^\"\n]*\"|'(?!\$\{\{)[^'\n]*'|[\"']?(?!\$\{\{)[^\s'\"]+[\"']?)"
         ),
         r"\1=<REDACTED>",
@@ -245,6 +264,9 @@ def max_tokens_from_env() -> int:
     an absent key. Empty is the normal path, not the error path, and it is
     tested as such. A value that is set but not a number falls back too: a
     typo in a repo variable should cost one review its tuning, not the review.
+    The fallback is said out loud on stderr, because a silent one would leave
+    a mistyped repository variable unnoticed for as long as nobody reads the
+    job log closely.
     """
     raw = os.getenv("CLAUDE_REVIEW_MAX_TOKENS", "").strip()
     if not raw:
@@ -252,11 +274,18 @@ def max_tokens_from_env() -> int:
     try:
         value = int(raw)
     except ValueError:
-        return DEFAULT_CLAUDE_REVIEW_MAX_TOKENS
+        value = 0
     # Zero and negatives are typos too: the API would reject them and the
     # review would fail for a reason unrelated to the diff. Too high is left
     # to the API, which knows the model's real limit and names it in the error.
-    return value if value > 0 else DEFAULT_CLAUDE_REVIEW_MAX_TOKENS
+    if value > 0:
+        return value
+    print(
+        f"::warning::CLAUDE_REVIEW_MAX_TOKENS={raw!r} is not a positive integer; "
+        f"using the script default {DEFAULT_CLAUDE_REVIEW_MAX_TOKENS}.",
+        file=sys.stderr,
+    )
+    return DEFAULT_CLAUDE_REVIEW_MAX_TOKENS
 
 
 def usage_summary(model: str, usage: dict[str, int] | None) -> str:
