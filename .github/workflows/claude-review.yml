@@ -1,3 +1,5 @@
+# AUTO-SYNCED from the LLM Builder Kit. Do not edit here; edit the kit source and re-run sync-standards.ps1.
+
 # Claude code review. Posts a review comment on every PR.
 #
 # A repo gets this file two ways: operator-tools/Bootstrap-Repo.ps1 at onboarding,
@@ -42,6 +44,11 @@ jobs:
     env:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       CLAUDE_REVIEW_MODEL: ${{ vars.CLAUDE_REVIEW_MODEL || 'claude-sonnet-5' }}
+      # Per-repo ceiling without editing this vendored file: set a repository
+      # variable. Unset, the script uses its own default (empty string fails
+      # int() and falls through). The one repo that needed a higher ceiling had
+      # edited this line by hand and tripped standards-drift doing it.
+      CLAUDE_REVIEW_MAX_TOKENS: ${{ vars.CLAUDE_REVIEW_MAX_TOKENS }}
       REVIEW_PROJECT_NAME: ${{ github.repository }}
       PR_NUMBER: ${{ github.event.pull_request.number || '' }}
       BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
@@ -109,8 +116,10 @@ jobs:
           path: claude-review.md
           if-no-files-found: ignore
 
+      # always(), so a truncated or empty review is still POSTED where it can be
+      # read. The check colour is decided separately, in the step after this one.
       - name: Post PR comment
-        if: github.event_name == 'pull_request_target'
+        if: always() && github.event_name == 'pull_request_target'
         run: |
           if [ -s claude-review.md ]; then
             if ! gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
@@ -127,3 +136,40 @@ jobs:
           else
             echo "Claude review did not produce output." >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      # A REVIEW THAT STOPPED EARLY DID NOT REVIEW THE REST.
+      #
+      # The truncation banner tells a human, but the green check is what gets
+      # trusted and what feeds the auto-merge verdict in review-standards.md. A
+      # review of PR #32 spent its entire 8,192-token ceiling on reasoning,
+      # emitted the words "This diff", billed $0.15, and passed. Same rule as
+      # the missing-key step at the top of this job: a check that pays, reports
+      # success, and verified an unknown fraction of the diff is worse than one
+      # that fails, because the green is what people act on.
+      #
+      # Runs LAST so the review is posted and summarised first.
+      - name: Require a complete review
+        if: always()
+        run: |
+          status="$(cat claude-review.status 2>/dev/null || echo missing)"
+          case "$status" in
+            ok|skipped)
+              echo "Claude review status: $status"
+              ;;
+            truncated)
+              echo "::error::The Claude review hit its output-token ceiling and is incomplete," \
+                   "so an unknown part of this diff went unreviewed. Raise CLAUDE_REVIEW_MAX_TOKENS" \
+                   "(currently ${CLAUDE_REVIEW_MAX_TOKENS:-the script default}) and re-run."
+              exit 1
+              ;;
+            empty)
+              echo "::error::The Claude review returned no text. This is a tooling failure," \
+                   "not a clean bill of health. See the posted comment for stop_reason."
+              exit 1
+              ;;
+            *)
+              echo "::error::No Claude review status was written, so nothing proves a review ran." \
+                   "Treating that as a failure rather than a pass."
+              exit 1
+              ;;
+          esac

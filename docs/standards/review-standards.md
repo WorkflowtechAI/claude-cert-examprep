@@ -78,4 +78,3 @@ status summary; the audit log records the chain. The verdict is advisory
 until the operator explicitly enables auto-merge: every reviewed task still
 lands as `review` for a human look. AGENTS.md's merge policy auto-merge
 criterion ("reviewer verdict is `autoMerge`") refers to this contract.
-

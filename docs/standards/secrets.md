@@ -1,4 +1,8 @@
+---
+kind: durable
+---
 <!-- AUTO-SYNCED from the LLM Builder Kit. Do not edit here; edit the kit source and re-run sync-standards.ps1. -->
+
 
 # Secure Workflow and Secret Locations
 
@@ -120,4 +124,3 @@ Rules:
 - Scope tokens to the exact repo/service/action.
 - Use short-lived credentials where available.
 - Redact before returning tool output to model context.
-

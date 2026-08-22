@@ -1,3 +1,6 @@
+# AUTO-SYNCED from the LLM Builder Kit. Do not edit here; edit the kit
+# source and re-run sync-standards.ps1.
+
 """Generic Claude code-review for a pull request or full-codebase snapshot.
 
 Dropped into a repo by operator-tools/Bootstrap-Repo.ps1 as
@@ -18,31 +21,64 @@ import urllib.error
 import urllib.request
 
 MAX_REVIEW_CHARS = 120_000
-# Must match the default in .github/workflows/claude-review.yml.
+# Must match Anthropic's model ID and the default in .github/workflows/claude-review.yml.
 DEFAULT_CLAUDE_REVIEW_MODEL = "claude-sonnet-5"
 # Tunable per repo without editing a vendored file. This script is copied into
 # every managed repo, so a hardcoded ceiling would mean editing N copies to
 # change one number; this mirrors CLAUDE_REVIEW_MODEL instead.
-DEFAULT_CLAUDE_REVIEW_MAX_TOKENS = 8192
+#
+# 8192 was NOT enough. This ceiling covers thinking AND the answer, and thinking
+# is not bounded by "be concise": observed reviews spent the entire 8,192-token
+# budget on reasoning and emitted ten words of text, billing real money for the
+# phrase "This diff" and passing green, while others truncated mid-finding. The
+# answer is the tail of the budget, so the budget has to be sized for the
+# reasoning in front of it. Repos that raised CLAUDE_REVIEW_MAX_TOKENS in their
+# own workflow to work around this no longer need to.
+DEFAULT_CLAUDE_REVIEW_MAX_TOKENS = 32000
 DEFAULT_INPUT_PRICE_USD_PER_MILLION = 3.0
 DEFAULT_OUTPUT_PRICE_USD_PER_MILLION = 15.0
 DEFAULT_CACHE_CREATION_INPUT_PRICE_MULTIPLIER = 1.25
 DEFAULT_CACHE_READ_INPUT_PRICE_MULTIPLIER = 0.10
 
 # Language-neutral: review source, config, and docs across common stacks.
+# fnmatch's `*` matches `/` too, so "*.py" already covers every depth; a
+# "**/*.py" form would be the same pattern written twice.
 ALLOW_PATTERNS = [
     "*.py", "*.js", "*.ts", "*.jsx", "*.tsx", "*.mjs", "*.cjs",
     "*.go", "*.rs", "*.rb", "*.java", "*.kt", "*.cs", "*.php", "*.swift",
     "*.c", "*.h", "*.cpp", "*.hpp", "*.sh", "*.ps1",
     "*.md", "*.yml", "*.yaml", "*.toml", "*.json", "*.sql",
-    "**/*.py", "**/*.js", "**/*.ts", "**/*.tsx", "**/*.go", "**/*.rs",
-    "**/*.rb", "**/*.java", "**/*.cs", "**/*.sql", ".github/**/*.yml",
 ]
 EXCLUDE_PATTERNS = [
     "**/node_modules/**", "**/.next/**", "**/dist/**", "**/build/**",
     "**/.venv/**", "**/venv/**", "**/vendor/**", "**/__pycache__/**",
     "*.lock", "**/package-lock.json", "**/pnpm-lock.yaml", "**/yarn.lock",
     "**/uv.lock", "**/poetry.lock", "**/Cargo.lock", "**/*.min.js", "**/*.map",
+]
+SECRET_PATTERNS = [
+    # A `${{ secrets.X }}` expression names a secret without containing one.
+    # Redacting it rewrote `ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}`
+    # into `API_KEY=<REDACTED> secrets... }}` before the model saw the diff, and
+    # the model then reported the workflow as broken YAML, as a blocking
+    # finding, on a line that was fine. The lookahead leaves expressions alone.
+    #
+    # A quoted value is a value too. The class excluded the opening quote, so
+    # `password: "abc123"` never matched and went to the model as written.
+    (
+        re.compile(
+            r"(?i)(api[_-]?key|token|secret|password|passwd|client[_-]?secret)"
+            r"\s*[:=]\s*(?!\$\{\{)[\"']?[^\s'\"]+[\"']?"
+        ),
+        r"\1=<REDACTED>",
+    ),
+    (re.compile(r"sk-[A-Za-z0-9_-]{20,}"), "sk-<REDACTED>"),
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "AKIA<REDACTED>"),
+    (
+        re.compile(
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S
+        ),
+        "<REDACTED_PRIVATE_KEY>",
+    ),
 ]
 
 
@@ -60,25 +96,6 @@ def base_head() -> tuple[str, str]:
     return base, head
 
 
-SECRET_PATTERNS = [
-    (
-        re.compile(
-            r"(?i)(api[_-]?key|token|secret|password|passwd|client[_-]?secret)"
-            r"\s*[:=]\s*[^\s'\"]+"
-        ),
-        r"\1=<REDACTED>",
-    ),
-    (re.compile(r"sk-[A-Za-z0-9_-]{20,}"), "sk-<REDACTED>"),
-    (re.compile(r"AKIA[0-9A-Z]{16}"), "AKIA<REDACTED>"),
-    (
-        re.compile(
-            r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S
-        ),
-        "<REDACTED_PRIVATE_KEY>",
-    ),
-]
-
-
 def redact(text: str) -> str:
     for pattern, replacement in SECRET_PATTERNS:
         text = pattern.sub(replacement, text)
@@ -86,8 +103,15 @@ def redact(text: str) -> str:
 
 
 def include_file(path: str) -> bool:
-    allowed = any(fnmatch.fnmatch(path, pattern) for pattern in ALLOW_PATTERNS)
-    excluded = any(fnmatch.fnmatch(path, pattern) for pattern in EXCLUDE_PATTERNS)
+    # fnmatch has no `**`. Its `*` does match `/`, so "**/dist/**" reads as
+    # "*/dist/*" and needs a slash BEFORE dist, which a root-level path does not
+    # have. Measured: "web/dist/x.js" was excluded and "dist/x.js" was reviewed,
+    # and a root package-lock.json went to the model in every PR that touched
+    # it. Matching against the path with a leading slash gives every depth,
+    # the root included, the same shape.
+    candidate = "/" + path
+    allowed = any(fnmatch.fnmatch(candidate, pattern) for pattern in ALLOW_PATTERNS)
+    excluded = any(fnmatch.fnmatch(candidate, pattern) for pattern in EXCLUDE_PATTERNS)
     return allowed and not excluded
 
 
@@ -158,6 +182,46 @@ def write_review(text: str) -> None:
         handle.write(text.strip() + "\n")
 
 
+# Machine-readable outcome, written beside the review so the workflow can decide
+# the CHECK COLOUR from what actually happened rather than from whether the
+# script crashed. Grepping the markdown for a banner would couple CI to prose.
+REVIEW_STATUS_PATH = "claude-review.status"
+STATUS_OK = "ok"
+STATUS_TRUNCATED = "truncated"
+STATUS_EMPTY = "empty"
+STATUS_SKIPPED = "skipped"
+
+# The banners review_text_from_body writes and review_status reads. One
+# definition for both, so the classifier cannot drift from the prose it keys
+# on; four separate reviews of this file flagged the two literals as a pair
+# that had to stay byte-identical by hand.
+EMPTY_BANNER = "**No review text came back from the API.**"
+TRUNCATED_BANNER = (
+    "> **Truncated: this review hit the output-token ceiling and is incomplete.**"
+)
+
+
+def write_status(status: str) -> None:
+    with open(REVIEW_STATUS_PATH, "w", encoding="utf-8") as handle:
+        handle.write(status + "\n")
+
+
+def review_status(text: str) -> str:
+    """Classify a finished review body.
+
+    A REVIEW THAT STOPPED EARLY DID NOT REVIEW THE REST. The banner tells a
+    human, but the green check is what gets trusted and what feeds the
+    auto-merge verdict, and the workflow already refuses that trade for a
+    missing API key. Same rule here: a review that verified an unknown fraction
+    of the diff must not report success.
+    """
+    if text.startswith(EMPTY_BANNER):
+        return STATUS_EMPTY
+    if text.startswith(TRUNCATED_BANNER):
+        return STATUS_TRUNCATED
+    return STATUS_OK
+
+
 def price_env(name: str, default: float) -> float:
     value = os.getenv(name, "").strip()
     if not value:
@@ -168,9 +232,33 @@ def price_env(name: str, default: float) -> float:
         return default
 
 
+def max_tokens_from_env() -> int:
+    """The output ceiling: CLAUDE_REVIEW_MAX_TOKENS, or the script default.
+
+    The workflow always sets the variable now, from a repository variable that
+    is usually unset, so the value this usually sees is the EMPTY STRING, not
+    an absent key. Empty is the normal path, not the error path, and it is
+    tested as such. A value that is set but not a number falls back too: a
+    typo in a repo variable should cost one review its tuning, not the review.
+    """
+    raw = os.getenv("CLAUDE_REVIEW_MAX_TOKENS", "").strip()
+    if not raw:
+        return DEFAULT_CLAUDE_REVIEW_MAX_TOKENS
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_CLAUDE_REVIEW_MAX_TOKENS
+    # Zero and negatives are typos too: the API would reject them and the
+    # review would fail for a reason unrelated to the diff. Too high is left
+    # to the API, which knows the model's real limit and names it in the error.
+    return value if value > 0 else DEFAULT_CLAUDE_REVIEW_MAX_TOKENS
+
+
 def usage_summary(model: str, usage: dict[str, int] | None) -> str:
     if not usage:
         return ""
+    # Per Anthropic's response schema, input_tokens is non-cached input;
+    # cache creation and cache read tokens are billed separately.
     input_tokens = int(usage.get("input_tokens", 0) or 0)
     output_tokens = int(usage.get("output_tokens", 0) or 0)
     cache_creation_tokens = int(usage.get("cache_creation_input_tokens", 0) or 0)
@@ -212,6 +300,11 @@ def usage_summary(model: str, usage: dict[str, int] | None) -> str:
         f"`{cache_creation_multiplier:g}x` cache creation, `{cache_read_multiplier:g}x` cache read",
         "- Anthropic billing is the source of truth.",
     ])
+    if model != DEFAULT_CLAUDE_REVIEW_MODEL:
+        lines.append(
+            f"- Pricing defaults are for `{DEFAULT_CLAUDE_REVIEW_MODEL}`; "
+            "override pricing env vars if needed."
+        )
     return "\n".join(lines)
 
 
@@ -247,7 +340,7 @@ def review_text_from_body(body: dict) -> str:
         # A truncated answer and an empty response are different problems with
         # different fixes, so say which one happened.
         return (
-            "**No review text came back from the API.** This is a tooling "
+            f"{EMPTY_BANNER} This is a tooling "
             f"failure, not a clean bill of health.\n\n- stop_reason: `{stop_reason}`\n"
             f"- content block types: `{kinds}`\n\n"
             "If stop_reason is `max_tokens`, raise the "
@@ -260,8 +353,7 @@ def review_text_from_body(body: dict) -> str:
     # mid-sentence, which reads as "all clear" to anyone skimming.
     if stop_reason == "max_tokens":
         return (
-            "> **Truncated: this review hit the output-token ceiling and is "
-            "incomplete.** Findings below may be cut off mid-thought, and "
+            f"{TRUNCATED_BANNER} Findings below may be cut off mid-thought, and "
             "later findings may be missing entirely. Raise the "
             "`CLAUDE_REVIEW_MAX_TOKENS` environment variable.\n\n" + text
         )
@@ -296,12 +388,7 @@ def call_claude(review_text: str, review_scope: str = "diff") -> str:
         )
         review_block = f"Diff:\n```diff\n{review_text}\n```"
     model = os.getenv("CLAUDE_REVIEW_MODEL", DEFAULT_CLAUDE_REVIEW_MODEL)
-    try:
-        max_tokens = int(
-            os.getenv("CLAUDE_REVIEW_MAX_TOKENS", DEFAULT_CLAUDE_REVIEW_MAX_TOKENS)
-        )
-    except ValueError:
-        max_tokens = DEFAULT_CLAUDE_REVIEW_MAX_TOKENS
+    max_tokens = max_tokens_from_env()
     payload = {
         # 2048 was cutting it close enough to matter: an observed review used
         # 2,036 output tokens of the 2,048 available and another landed on
@@ -363,8 +450,14 @@ def main() -> int:
         review_text = diff_text(base, head)
     if not review_text.strip():
         write_review("## Claude Code Review\n\nSkipped: no reviewable diff.")
+        write_status(STATUS_SKIPPED)
         return 0
-    write_review(call_claude(review_text, review_scope=review_scope))
+
+    body = call_claude(review_text, review_scope=review_scope)
+    write_review(body)
+    # The status is read from the REVIEW TEXT, which is the part
+    # review_text_from_body already classified, not from the wrapper.
+    write_status(review_status(body.split("## Claude Code Review\n\n", 1)[-1]))
     return 0
 
 
