@@ -62,12 +62,17 @@ SECRET_PATTERNS = [
     # the model then reported the workflow as broken YAML, as a blocking
     # finding, on a line that was fine. The lookahead leaves expressions alone.
     #
-    # A quoted value is a value too. The class excluded the opening quote, so
-    # `password: "abc123"` never matched and went to the model as written.
+    # A quoted value is a value too, and it runs to its closing quote, spaces
+    # included: `password: "abc123"` never matched when the class excluded the
+    # opening quote, and `password: "correct horse battery"` lost only its first
+    # word. A quoted EXPRESSION is left alone like an unquoted one, since
+    # `"${{ secrets.X }}"` is ordinary YAML quoting. An unterminated quote
+    # falls back to the bare-token form.
     (
         re.compile(
             r"(?i)(api[_-]?key|token|secret|password|passwd|client[_-]?secret)"
-            r"\s*[:=]\s*(?!\$\{\{)[\"']?[^\s'\"]+[\"']?"
+            r"\s*[:=]\s*"
+            r"(?:\"(?!\$\{\{)[^\"\n]*\"|'(?!\$\{\{)[^'\n]*'|[\"']?(?!\$\{\{)[^\s'\"]+[\"']?)"
         ),
         r"\1=<REDACTED>",
     ),
