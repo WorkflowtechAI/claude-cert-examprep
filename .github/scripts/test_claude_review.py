@@ -239,6 +239,12 @@ class RedactionLeavesActionsExpressionsAlone(unittest.TestCase):
         line = "      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}"
         self.assertEqual(claude_review.redact(line), line)
 
+    def test_a_quoted_workflow_expression_survives_too(self):
+        # "${{ ... }}" is ordinary YAML quoting; it names a secret, contains none.
+        for line in ('      TOKEN: "${{ secrets.TOKEN }}"', "      LIMIT: '${{ vars.LIMIT }}'"):
+            with self.subTest(line=line):
+                self.assertEqual(claude_review.redact(line), line)
+
     def test_a_real_value_is_still_redacted(self):
         self.assertEqual(
             claude_review.redact("api_key = sk_live_abc123def456"),
@@ -253,6 +259,10 @@ class RedactionLeavesActionsExpressionsAlone(unittest.TestCase):
             'password: "hunter2"': "password=<REDACTED>",
             "api_key='sk_live_abc123'": "api_key=<REDACTED>",
             'TOKEN = "abc123"': "TOKEN=<REDACTED>",
+            # Spaces inside the quotes are part of the value; the tail used to leak.
+            'password: "correct horse battery"': "password=<REDACTED>",
+            # An unterminated quote still hides the token after it.
+            'password: "unterminated': "password=<REDACTED>",
         }
         for line, want in cases.items():
             with self.subTest(line=line):
