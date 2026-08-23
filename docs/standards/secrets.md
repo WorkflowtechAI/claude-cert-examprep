@@ -104,6 +104,19 @@ Rules:
 - rotate secrets after suspected exposure;
 - never print secrets during workflow debugging.
 
+**Every repo scans its own diffs for committed credentials.** `secret-scan.yml`
+is a vendored standard, so a repo receives it on every sync and does not have to
+ask. It is declinable, and declining means *this repo runs an equivalent scanner
+of its own* — not that it opted out of scanning. The kit is the one repo that
+declines today, because its copy carries an exclude file and a base/head
+override the generic template should not.
+
+A decline is not on the honour system: `Get-ProjectStatus.ps1` reports
+`no secret scanning` for any repo whose workflows mention no scanner at all, and
+it looks for the tool (`gitleaks`, `trufflehog`, `detect-secrets`), not for this
+file's name — so a repo with its own scanner passes and a repo with nothing is
+visible. That report is the audit; the vendored file is only the default.
+
 ## SSH
 
 - Personal SSH keys stay under the user profile `.ssh` directory with normal OS permissions.

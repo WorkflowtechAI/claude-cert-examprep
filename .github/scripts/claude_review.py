@@ -63,6 +63,41 @@ _TYPE_WORD = (
 )
 _TYPE = _TYPE_WORD + r"(?:[ \t]*\|[ \t]*" + _TYPE_WORD + r")*"
 
+# An env-var lookup NAMES a secret without containing one, the same category as
+# the `${{ secrets.X }}` expression the pattern already leaves alone, and it is
+# exempted for the same reason: redacting it rewrites working code into
+# something that does not parse. `token = os.environ.get("GITHUB_TOKEN") or ""`
+# reached the model as `token=<REDACTED> or ""`, and the model reported a
+# SyntaxError as a BLOCKING finding, twice in a row on kit #69, spending the
+# whole review on an artifact. claude_review.py's own source hits this.
+#
+# NARROWED THREE WAYS, SO IT CANNOT HIDE A VALUE AND OVERTURNS NOTHING.
+# (1) The call takes ONE string argument, so `os.environ.get("PW", "hunter2")`
+# is not a lookup here and its default is still redacted. (2) The exemption is
+# withdrawn if the rest of the line holds a non-empty quoted literal, so
+# `... or "hunter2"` is still redacted while `... or ""` is left alone. (3) It
+# does not apply where a type annotation was consumed, so
+# `password: str = os.getenv("X")` still redacts type and default together.
+# (4) The argument must look like an env var NAME -- an identifier, so
+# `os.getenv("sk-ant-real-secret")` is not a lookup here and is redacted. An env
+# var name is an identifier; a key generally is not, and matching on call shape
+# alone would have let one through (caught in review on #74).
+#
+# The withdrawal in (2) reads ONE line, like every other branch in this table,
+# so a fallback literal on a continuation line is not seen. That is the
+# pre-existing limit of a line-oriented heuristic, not something this exemption
+# widens: the same is true of every value shape here.
+#
+# `os.environ["X"]` is likewise left OUT: the subscript rule already redacts it
+# and `token=<REDACTED>` reads as valid code, which is all this exemption is
+# for. The shape that broke was the trailing ` or ""`, not the lookup itself.
+# Every one of those is pinned by an exact-output test.
+_ENV_LOOKUP = (
+    r"(?:(?:os\.environ\.get|os\.getenv)[ \t]*\([ \t]*[\"'][A-Za-z_][A-Za-z0-9_]*[\"'][ \t]*\)"
+    r"|process\.env\.[A-Za-z_]\w*)"
+    r"(?![^\n]*[\"'][^\"'\n]+[\"'])"
+)
+
 SECRET_PATTERNS = [
     # The key=value rule. A heuristic last line in front of the model, not a
     # substitute for keeping secrets out of commits: the name list is short on
@@ -178,6 +213,7 @@ SECRET_PATTERNS = [
             (?(q)[ \t]*
               |[ \t]*(?:\r?\n(?:[-+ ]|(?![-+ ]))(?![ \t]*[\w.-]+:(?:[ \t]|\r?\n|$)))?[ \t]*)
             (?:(?P<type>%(T)s))?(?(type)[ \t]*=[ \t]*|)
+            (?(type)|(?!%(E)s))
             (?:
                 "(?![ \t]*\$\{\{)(?:[^"\\\n]|\\.|"")*"
               | '(?![ \t]*\$\{\{)(?:[^'\\\n]|\\.|'')*'
@@ -191,7 +227,7 @@ SECRET_PATTERNS = [
                   | (?!\$\{\{)[^\s'",;)]+
                 )
             )
-            """ % {"T": _TYPE},
+            """ % {"T": _TYPE, "E": _ENV_LOOKUP},
             re.I | re.X,
         ),
         r"\g<key>=<REDACTED>",

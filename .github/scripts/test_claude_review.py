@@ -528,6 +528,109 @@ class RedactionLeavesActionsExpressionsAlone(unittest.TestCase):
                 self.assertTrue(out.endswith(term), out)
 
 
+class RedactionSparesEnvLookups(unittest.TestCase):
+    """An env-var lookup NAMES a secret without containing one, so it is left
+    alone -- the same category as a `${{ secrets.X }}` expression, and exempted
+    for the same reason.
+
+    `token = os.environ.get("GITHUB_TOKEN") or ""` reached the model as
+    `token=<REDACTED> or ""`, which is not valid Python, and the model reported
+    a SyntaxError as a BLOCKING finding on kit #69 -- twice in a row, spending
+    the whole review on an artifact and citing corroborating "evidence" (`import
+    os` is unused) that was also the artifact. claude_review.py's own source
+    hits this shape.
+
+    THE EXEMPTION IS NARROWED SO IT CANNOT HIDE A VALUE, which is the only
+    reason it is safe. The call form takes ONE string argument, so a default
+    argument is not an env lookup and is still redacted; and the exemption is
+    withdrawn entirely if the rest of the line carries a non-empty quoted
+    literal, so an `or "hunter2"` fallback is still redacted while `or ""` is
+    not. Both halves are pinned below: the MUST-REDACT cases matter more than
+    the tidy ones, because that is the direction that leaks.
+    """
+
+    def test_a_bare_lookup_is_left_exactly_as_written(self):
+        for line in (
+            'token = os.environ.get("GITHUB_TOKEN")',
+            'token = os.getenv("GH_TOKEN") or ""',
+            'token = os.environ.get("GITHUB_TOKEN") or ""',
+            "const token = process.env.GITHUB_TOKEN;",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(line, claude_review.redact(line))
+
+    def test_a_default_argument_is_a_value_and_is_still_redacted(self):
+        # os.environ.get(NAME, DEFAULT): the default can be a real secret, so
+        # the two-argument form is deliberately not an env lookup here.
+        self.assertEqual(
+            "password=<REDACTED>",
+            claude_review.redact('password = os.environ.get("PW", "hunter2")'),
+        )
+        self.assertEqual(
+            "token=<REDACTED>", claude_review.redact('token = os.getenv("T", "sk-live-abc123")')
+        )
+
+    def test_a_literal_fallback_on_the_line_withdraws_the_exemption(self):
+        # The line is REDACTED rather than left verbatim, which is the whole
+        # guarantee: the exemption never applies where a literal is in reach.
+        # What survives after the redacted value is unchanged from before this
+        # exemption existed and is not this rule's to fix -- a trailing literal
+        # after ANY redacted call value stays visible (`resolveKey("X") or
+        # "hunter2"` reads the same way), because the value token ends at the
+        # closing paren. The redactor is a heuristic last line, not a
+        # guarantee, as SECRET_PATTERNS says at the top.
+        for line in (
+            'token = os.environ.get("X") or "hunter2"',
+            'token = os.getenv("X") if x else "hunter2"',
+            'const token = process.env.X || "hunter2";',
+        ):
+            with self.subTest(line=line):
+                out = claude_review.redact(line)
+                self.assertIn("<REDACTED>", out)
+                self.assertNotEqual(line, out)
+
+    def test_the_exemption_matches_the_unexempted_baseline_on_those_lines(self):
+        # Same input, same output as a non-env call value: proof the exemption
+        # withdrew completely rather than half-applying.
+        self.assertEqual(
+            claude_review.redact('token = resolveKey("X") or "hunter2"'),
+            claude_review.redact('token = os.environ.get("X") or "hunter2"'),
+        )
+
+    def test_a_non_identifier_argument_is_not_a_lookup(self):
+        # Matching on call shape alone would exempt this and hand the model a
+        # real key. An env var name is an identifier; a key generally is not.
+        for line in (
+            'token = os.getenv("sk-ant-real-secret-value")',
+            'api_key = os.environ.get("AKIA-NOT/AN.IDENT")',
+            "token = os.getenv(\'hunter two\')",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual("<REDACTED>", claude_review.redact(line).split("=", 1)[1])
+
+    def test_a_lookalike_that_is_not_an_env_lookup_is_still_redacted(self):
+        # Only the exempted forms are exempt; anything that merely resembles
+        # one is an ordinary call and is consumed whole.
+        self.assertEqual("token=<REDACTED>", claude_review.redact('token = myenv.get("X")'))
+        self.assertEqual("token=<REDACTED>", claude_review.redact('token = get_environ("X")'))
+
+    def test_the_subscript_form_is_deliberately_not_exempt(self):
+        # `os.environ["X"]` stays on the subscript rule, which predates this
+        # exemption and is pinned by RedactionSparesCode. Nothing is gained by
+        # exempting it: `token=<REDACTED>` already reads as valid code. What
+        # broke was the trailing ` or ""` after a consumed CALL, not the lookup.
+        self.assertEqual(
+            "token=<REDACTED>", claude_review.redact('token = os.environ["TOKEN"]')
+        )
+
+    def test_a_typed_default_is_deliberately_not_exempt(self):
+        # A type annotation means type and default are redacted together, which
+        # predates this exemption and is pinned by RedactionSparesTypeAnnotations.
+        self.assertEqual(
+            "password=<REDACTED>", claude_review.redact('password: str = os.getenv("X")')
+        )
+
+
 class RedactionSparesCode(unittest.TestCase):
     """A key-name followed by a FUNCTION CALL is redacted whole, never left dangling.
 
@@ -805,8 +908,10 @@ class TheRunnerFollowsRepoVisibility(unittest.TestCase):
     the VPS, so public goes hosted.
 
     The test is the string 'public' on purpose: a missing or unknown visibility
-    falls to the pool (the private default), which fails loudly on a public repo
-    rather than silently billing a private one. A bare `ubuntu-latest` is the
+    falls to the pool (the private default), which stays a visibly queued,
+    never-green check on a public repo rather than silently billing a private
+    one. (Queued is loud in the sense that it never goes green, not in the
+    sense of an immediate failure.) A bare `ubuntu-latest` is the
     regression that spent the org's hosted minutes; a bare self-hosted list is
     the one that stranded the public repo. Both fail here.
     """

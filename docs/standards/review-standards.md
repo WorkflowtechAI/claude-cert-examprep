@@ -23,7 +23,18 @@ merge policy. Repos vendor this as `docs/standards/review-standards.md`
    types at boundaries, dead code removed when in scope, comments explain
    intent, dependencies justified.
 5. **Tests**: behavior changes come with test changes; the relevant suite
-   passes; the tests still assert the intended behavior.
+   passes; the tests still assert the intended behavior. Reject a new or
+   changed test that falls into one of three anti-patterns: **tautological**
+   (the assertion recomputes the expected value the way the code does, so it
+   passes by construction and can never disagree with the implementation —
+   expected values must come from an independent source of truth: a
+   known-good literal, a worked example, the spec); **implementation-coupled**
+   (mocks internal collaborators, tests a private method, or verifies through
+   a side channel like querying the database directly instead of the public
+   interface — the tell is a test that breaks on refactor with no behavior
+   change); or **horizontal-slicing** (a PR that adds a block of tests for
+   behavior the change doesn't implement yet, or tests written against the
+   imagined shape of the code rather than what the diff actually does).
 6. **Security**: the surfaces in the escalation list below, plus the security
    baseline in coding-rules. Any concern of any severity escalates.
 
