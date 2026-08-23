@@ -55,45 +55,146 @@ EXCLUDE_PATTERNS = [
     "*.lock", "**/package-lock.json", "**/pnpm-lock.yaml", "**/yarn.lock",
     "**/uv.lock", "**/poetry.lock", "**/Cargo.lock", "**/*.min.js", "**/*.map",
 ]
+# A closed set of type words. None is ever a secret, so a bare one after
+# `password:` is an annotation; the SECRET_PATTERNS comment says how it is used.
+_TYPE_WORD = (
+    r"(?:str|int|float|boolean|bool|bytes|string|number|any|unknown|object"
+    r"|dict|list|null|None|undefined)\b"
+)
+_TYPE = _TYPE_WORD + r"(?:[ \t]*\|[ \t]*" + _TYPE_WORD + r")*"
+
 SECRET_PATTERNS = [
+    # The key=value rule. A heuristic last line in front of the model, not a
+    # substitute for keeping secrets out of commits: the name list is short on
+    # purpose, and every shape below is pinned by an exact-output test in
+    # test_claude_review.py, in both copies; the kit's suite also checks that
+    # this table and the template's are identical.
+    #
+    # NAMES. Unanchored at the start, so `db_password` and `STRIPE_SECRET_KEY`
+    # match on their tail; closed at the end by the quote, space or separator
+    # that has to follow, so `passwordless`, `token_url` and `tokens` are other
+    # names and stay as written. The `_key` family is spelled out because the
+    # tail rule cannot reach it: `SECRET_KEY` (Django), `SECRET_KEY_BASE`
+    # (Rails), `AWS_SECRET_ACCESS_KEY`, `PRIVATE_KEY`, `ACCESS_KEY`. A bare
+    # `key` is not a name: `primary_key=True` and `for key, value` are code.
+    #
+    # SEPARATOR. `:`, `=`, `:=` (walrus) or `=>` (PHP array, match arm), and
+    # never the first character of `==`, `===` or `=>`: `password == other` is
+    # a comparison, and matching its first `=` redacted the second and left
+    # the line unable to parse. `'password' => 'hunter2'` used to slip through
+    # the same gap as the JSON key below. A match arm, `token => x` or
+    # `token => f(x)`, is redacted, an accepted over-redaction.
+    #
     # A `${{ secrets.X }}` expression names a secret without containing one.
     # Redacting it rewrote `ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}`
     # into `API_KEY=<REDACTED> secrets... }}` before the model saw the diff, and
     # the model then reported the workflow as broken YAML, as a blocking
-    # finding, on a line that was fine. The lookahead leaves expressions alone.
+    # finding, on a line that was fine. The lookahead leaves expressions alone,
+    # quoted or bare, and with the stray space of `" ${{ secrets.X }}"`: that
+    # is still an expression, and the space is a workflow bug the model can
+    # only flag if it gets to see it.
     #
     # A quoted value is a value too, and it runs to its closing quote, spaces
     # included: `password: "abc123"` never matched when the class excluded the
     # opening quote, and `password: "correct horse battery"` lost only its first
-    # word. A quoted EXPRESSION is left alone like an unquoted one, since
-    # `"${{ secrets.X }}"` is ordinary YAML quoting. An unterminated quote
-    # falls back to the bare-token form.
+    # word. An escaped quote inside the value does not close it: `"hun\"ter2"`
+    # matched up to the backslash and leaked `ter2"}` to the model, the one
+    # leak the downstream reviews of the JSON-key fix found. `\\.` takes any
+    # backslash escape, `""` / `''` the doubled quote of YAML single quotes,
+    # SQL and PowerShell. An unterminated quote falls back to the bare-token
+    # form.
     #
     # A JSON key carries its closing quote between the name and the colon, so
     # `"password": "hunter2"` never matched: `\s*[:=]` had to follow the name
     # directly, and the whole value went to the model as written (verified with
-    # a probe on 2026-08-22). A quote after the name (group 2) admits the JSON
-    # and Python-dict forms; the value branch already runs to the closing quote,
-    # and the name is not anchored, so `"db_password"`, the common JSON shape of
-    # a longer key that ENDS in a secret name, matches the same way. In that
-    # form the value has to sit on the key's line, which the conditional on
-    # group 2 enforces: a JSON value always does, and `if kind == "token":`
-    # followed by a line of code is code, not a secret. The unquoted form keeps
-    # spanning the line break, since YAML allows `password:` with its scalar on
-    # the next line.
+    # a probe on 2026-08-22). A quote after the name (group `q`) admits the JSON
+    # and Python-dict forms, and that form stays on one line, separator and
+    # value alike, which the conditionals on `q` enforce: no serializer breaks
+    # the line between a key and its colon, a JSON value always follows on the
+    # key's line, and a quoted name that does end a line is code: `if kind ==
+    # "token":` above a line of code, or a formatted ternary with `? "token"`
+    # above `: "cookie"`.
     #
-    # The separator is `:`, `=`, `:=` (walrus) or `=>` (PHP array), and never
-    # the first character of `==` or `===`: `password == other` is a comparison,
-    # and matching its first `=` redacted the second and left the line unable
-    # to parse. `'password' => 'hunter2'` used to slip through the same gap as
-    # the JSON key.
+    # The unquoted form spans ONE line break, since YAML allows `password:`
+    # with its scalar on the next line. It reads through the `+`, `-` or space
+    # that prefixes every line of a diff, which is what this function mostly
+    # sees, and which the old `\s*` took as the value, leaving the real one on
+    # the wire. It stops at a blank line (`password:` in prose, then a code
+    # fence) and at a sibling key (`password:` left empty, `username:` below
+    # it), both of which used to be folded into one mangled line. The one
+    # shape it leaves on purpose is a next-line value that is itself `word:`
+    # at the end of its line, which cannot be told from a key; on the key's
+    # own line a value ending in `:` is a value and is redacted.
+    #
+    # A value that opens a call is redacted WHOLE, through its closing paren.
+    # `brokerApiKey: resolveKey("LITELLM_API_KEY"),` used to come out as
+    # `brokerApiKey=<REDACTED>LITELLM_API_KEY"),`: the bare branch stopped at
+    # the first quote and left a dangling fragment, which the model reported
+    # as a "broken hunk" on a line that compiles, as a blocking finding,
+    # round after round. Leaving calls alone was tried first and is wrong:
+    # `password=hunter2(prod)` is call-shaped too, and a redactor that skips
+    # it leaks. So `ident(...)`, `ident[...]`, `$(...)`, a bare `(...)` and
+    # any run of those suffixes are consumed, three paren levels deep (a call
+    # in a call in the value's own call), and replaced like any other value:
+    # nothing dangles, nothing leaks, and a literal passed as an argument goes
+    # with it. A call that breaks across lines, or nests a fourth level, falls
+    # back to the bare form: the first fragment is redacted and the rest stays,
+    # a display cost, with a literal argument that deep left visible. The
+    # token ends before `,`, `;` and `)`, which no secret contains and which
+    # the code around a value does: `login(password=pw, user=u)` used to lose
+    # its comma and `connect(host=h, password=pw)` its closing paren. A
+    # trailing quote is the value's own only when a leading one opened it
+    # (the unterminated-quote fallback); otherwise it closes the ENCLOSING
+    # literal and stays, so `x('api_key=abc123')` keeps its closing quote
+    # instead of reading as an unterminated string in the reviewed diff. A
+    # lone `-` or `+` before a space is a list marker or a diff marker, not a
+    # value, so `password:` above `- item` stays as written.
+    #
+    # A bare value that is a type word is an annotation, not a secret: every
+    # typed Python signature (`def login(user: str, password: str)`) and TS
+    # parameter (`(_token: string) => {}`) matched here, and the model then
+    # reported the file as syntactically broken. A closed set of type words
+    # (_TYPE), optionally `| None`, with no `=` after it, is left as written,
+    # and so is an absent value (`password = None`, `token = null`). A typed
+    # DEFAULT is a value and goes whole: `password: str = "hunter2"` redacts
+    # type and default together, so nothing that was masked before becomes
+    # visible but the type word itself. A quoted literal under a secret name
+    # (`{ token: "h" }`) stays redacted, and typing generics (`Optional[str]`)
+    # are not in the set and still redact as a subscript.
+    #
+    # re.VERBOSE, so the branches can sit one per line: whitespace outside a
+    # character class is layout, not pattern. Named groups, so the conditionals
+    # and the replacement read as what they test rather than as a number.
     (
         re.compile(
-            r"(?i)(api[_-]?key|token|secret|password|passwd|client[_-]?secret)([\"'])?"
-            r"\s*(?:=>|:=|[:=](?!=))(?(2)[ \t]*|\s*)"
-            r"(?:\"(?!\$\{\{)[^\"\n]*\"|'(?!\$\{\{)[^'\n]*'|[\"']?(?!\$\{\{)[^\s'\"]+[\"']?)"
+            r"""
+            (?P<key>
+                api[_-]?key | access[_-]?key | private[_-]?key
+              | secret(?:[_-]?access)?[_-]?key(?:[_-]?base)?
+              | token | secret | password | passwd | client[_-]?secret
+            )
+            (?P<q>["'])?
+            (?(q)[ \t]*|\s*)(?:=>|:=|[:=](?![=>]))
+            (?(q)[ \t]*
+              |[ \t]*(?:\r?\n(?:[-+ ]|(?![-+ ]))(?![ \t]*[\w.-]+:(?:[ \t]|\r?\n|$)))?[ \t]*)
+            (?:(?P<type>%(T)s))?(?(type)[ \t]*=[ \t]*|)
+            (?:
+                "(?![ \t]*\$\{\{)(?:[^"\\\n]|\\.|"")*"
+              | '(?![ \t]*\$\{\{)(?:[^'\\\n]|\\.|'')*'
+              | (?![-+](?:[ \t]|\r?\n|$))
+                (?(type)|(?!%(T)s[ \t]*(?:[,;)\]}:|]|\r?\n|$)))
+                (?:
+                    (?:[A-Za-z_$][\w.]*)?
+                    (?:\((?:[^()\n]|\((?:[^()\n]|\([^()\n]*\))*\))*\)|\[[^\[\]\n]*\])+
+                    [^\s'",;)]*
+                  | ["'](?!\$\{\{)[^\s'",;)]+["']?
+                  | (?!\$\{\{)[^\s'",;)]+
+                )
+            )
+            """ % {"T": _TYPE},
+            re.I | re.X,
         ),
-        r"\1=<REDACTED>",
+        r"\g<key>=<REDACTED>",
     ),
     (re.compile(r"sk-[A-Za-z0-9_-]{20,}"), "sk-<REDACTED>"),
     (re.compile(r"AKIA[0-9A-Z]{16}"), "AKIA<REDACTED>"),

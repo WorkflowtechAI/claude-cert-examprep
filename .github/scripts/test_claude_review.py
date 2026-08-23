@@ -18,8 +18,10 @@ discover .github/scripts` or `python .github/scripts/test_claude_review.py`.
 import contextlib
 import importlib.util
 import io
+import itertools
 import os
 import re
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -306,7 +308,7 @@ class RedactionLeavesActionsExpressionsAlone(unittest.TestCase):
 
     def test_a_real_value_is_still_redacted(self):
         self.assertEqual(
-            claude_review.redact("api_key = sk_live_abc123def456"),
+            claude_review.redact("api_key = fake_abc123def456"),
             "api_key=<REDACTED>",
         )
         self.assertNotIn("hunter2", claude_review.redact("password: hunter2"))
@@ -316,7 +318,7 @@ class RedactionLeavesActionsExpressionsAlone(unittest.TestCase):
         # never matched and went to the model as written.
         cases = {
             'password: "hunter2"': "password=<REDACTED>",
-            "api_key='sk_live_abc123'": "api_key=<REDACTED>",
+            "api_key='fake_abc123'": "api_key=<REDACTED>",
             'TOKEN = "abc123"': "TOKEN=<REDACTED>",
             # Spaces inside the quotes are part of the value; the tail used to leak.
             'password: "correct horse battery"': "password=<REDACTED>",
@@ -337,7 +339,7 @@ class RedactionLeavesActionsExpressionsAlone(unittest.TestCase):
         # with a probe on 2026-08-22.
         cases = {
             '{"password": "hunter2", "user": "bob"}': '{"password=<REDACTED>, "user": "bob"}',
-            '{"api_key":"sk_live_abc123"}': '{"api_key=<REDACTED>}',
+            '{"api_key":"fake_abc123"}': '{"api_key=<REDACTED>}',
             # A Python dict quotes the same way, with the other quote.
             "{'client_secret': 'abc123'}": "{'client_secret=<REDACTED>}",
             # The common JSON shape is a longer key that ENDS in a secret name.
@@ -378,6 +380,357 @@ class RedactionLeavesActionsExpressionsAlone(unittest.TestCase):
             "'password' => 'hunter2',": "'password=<REDACTED>,",
             # Python walrus: `:=` is one separator, not a colon and a stray `=`.
             'if (password := "hunter2"):': "if (password=<REDACTED>):",
+        }
+        for line, want in cases.items():
+            with self.subTest(line=line):
+                self.assertEqual(claude_review.redact(line), want)
+
+    def test_an_escaped_quote_does_not_end_the_value(self):
+        # `"hun\"ter2"` matched up to the backslash and leaked `ter2"}` to the
+        # model: the value class stopped at any quote. A backslash escape is
+        # part of the value, and so is the doubled quote that YAML single
+        # quotes, SQL and PowerShell use. An empty value is two quotes, not a
+        # doubled one.
+        cases = {
+            '{"password": "hun\\"ter2"}': '{"password=<REDACTED>}',
+            "password = 'it\\'s'": "password=<REDACTED>",
+            # A regex literal is the everyday shape of an escaped quote.
+            'token = "[^\\"]+"': "token=<REDACTED>",
+            # An escaped backslash before the closing quote does not escape it.
+            'password: "C:\\\\"': "password=<REDACTED>",
+            "password: 'it''s'": "password=<REDACTED>",
+            '$password = "say ""hi"""': "$password=<REDACTED>",
+            '{"password": "", "user": "bob"}': '{"password=<REDACTED>, "user": "bob"}',
+            '"password": ""': '"password=<REDACTED>',
+        }
+        for line, want in cases.items():
+            with self.subTest(line=line):
+                self.assertEqual(claude_review.redact(line), want)
+
+    def test_a_quoted_expression_survives_a_leading_space(self):
+        # `" ${{ secrets.X }}"` is still an expression. It was redacted because
+        # the lookahead sat right after the opening quote, and the stray space
+        # is a workflow bug the model can only flag if it gets to see it.
+        for line in (
+            '      TOKEN: " ${{ secrets.TOKEN }}"',
+            '{"TOKEN": "  ${{ secrets.TOKEN }}"}',
+            "      TOKEN: '\t${{ secrets.TOKEN }}'",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(claude_review.redact(line), line)
+
+    def test_a_quoted_key_and_its_separator_share_a_line(self):
+        # The quoted-key form is one line: key, separator, value. No serializer
+        # breaks the line between a key and its colon; the shape that does put
+        # a quoted name above a `:` is a formatted ternary, which used to be
+        # folded into one mangled line.
+        line = 'const kind = isToken\n  ? "token"\n  : "cookie";'
+        self.assertEqual(claude_review.redact(line), line)
+        self.assertEqual(claude_review.redact('"password"\n: "x"'), '"password"\n: "x"')
+
+    def test_the_unquoted_form_spans_one_line_break_through_a_diff_prefix(self):
+        # YAML allows `password:` with its scalar on the next line. In a diff,
+        # which is what redact() mostly sees, that next line starts with `+`,
+        # `-` or a space, and the old `\s*` took the prefix as the value and
+        # left the real one on the wire.
+        redacted = {
+            "+password:\n+  hunter2": "+password=<REDACTED>",
+            "-password:\n-  hunter2": "-password=<REDACTED>",
+            ' password:\n   "hunter2"': " password=<REDACTED>",
+            "password:\n\thunter2": "password=<REDACTED>",
+            # A value with a colon in it is a value, not a sibling key: the key
+            # shape is `word:` followed by a space or the end of the line.
+            "password:\n  redis://user:hunter2@host": "password=<REDACTED>",
+            "password:\n  db.internal:5432": "password=<REDACTED>",
+            # On the key's own line a value ending in `:` is a value.
+            "token: abc123:": "token=<REDACTED>",
+        }
+        for text, want in redacted.items():
+            with self.subTest(text=text):
+                self.assertEqual(claude_review.redact(text), want)
+        for text in (
+            # One line break. A blank line ends the search: `password:` in
+            # prose, then a code fence, used to lose the fence.
+            "Set the password:\n\n```bash\nlogin",
+            "password:\n\nhunter2",
+            # A sibling key is not the value of an empty `password:`.
+            "+  password:\n+  username: bob",
+            "password:\n  username: bob",
+            # The accepted gap: a next-line value that is itself `word:` at the
+            # end of its line cannot be told from a sibling key, and the key is
+            # the common shape.
+            "password:\n  abc123:",
+            # A lone dash is a list marker (or a diff marker), not a value.
+            "password:\n  - item",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(claude_review.redact(text), text)
+
+    def test_the_shapes_combine(self):
+        cases = {
+            # Unanchored name, PHP arrow and quoted key at once.
+            "'db_password' => 'hunter2',": "'db_password=<REDACTED>,",
+            '"password" => "hunter2",': '"password=<REDACTED>,',
+            # The match is case-insensitive and the replacement keeps the case.
+            '"Password": "hunter2"': '"Password=<REDACTED>',
+            'Api-Key = "x"': "Api-Key=<REDACTED>",
+        }
+        for line, want in cases.items():
+            with self.subTest(line=line):
+                self.assertEqual(claude_review.redact(line), want)
+
+    def test_the_key_family_is_named_and_a_near_miss_is_another_name(self):
+        # The name is unanchored at the start (`db_password`) and closed at the
+        # end by the quote, space or separator that follows it. `SECRET_KEY`
+        # and its relatives fail that closing rule on `_KEY`, so the family is
+        # spelled out; `passwordless`, `token_url` and `tokens` fail it too,
+        # and are other names. Pinned so a widening is a conscious change.
+        redacted = {
+            'SECRET_KEY = "django-insecure-fake"': "SECRET_KEY=<REDACTED>",
+            "STRIPE_SECRET_KEY=fake_abc": "STRIPE_SECRET_KEY=<REDACTED>",
+            "AWS_SECRET_ACCESS_KEY=fake_abc": "AWS_SECRET_ACCESS_KEY=<REDACTED>",
+            "SECRET_KEY_BASE=fake_abc": "SECRET_KEY_BASE=<REDACTED>",
+            "MINIO_ACCESS_KEY=fake_abc": "MINIO_ACCESS_KEY=<REDACTED>",
+            "private_key: fake_abc": "private_key=<REDACTED>",
+        }
+        for line, want in redacted.items():
+            with self.subTest(line=line):
+                self.assertEqual(claude_review.redact(line), want)
+        for line in (
+            "passwordless=true",
+            'token_url = "https://example.test/oauth/token"',
+            "tokens = text.split()",
+            "secrets: inherit",
+            "primary_key=True",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(claude_review.redact(line), line)
+
+    def test_no_literal_survives_any_combination_of_shapes(self):
+        # The cases above are the incidents. This is the general claim they
+        # stand in for: a name in any key shape, any separator, any quoting
+        # and any terminator after the value, and the literal never reaches
+        # the model, the name stays, the terminator stays. Deterministic, so
+        # a failure names its line.
+        names = ("password", "API_KEY", "db_password", "SECRET_KEY", "client_secret", "Token")
+        key_quotes = ("", '"', "'")
+        separators = (":", ": ", "=", " = ", ":=", " => ")
+        value_quotes = ("", '"', "'")
+        terminators = ("", ",", ";", ")", " # note", "\n")
+        for name, kq, sep, vq, term in itertools.product(
+            names, key_quotes, separators, value_quotes, terminators
+        ):
+            line = f"{kq}{name}{kq}{sep}{vq}hunter2{vq}{term}"
+            with self.subTest(line=line):
+                out = claude_review.redact(line)
+                self.assertNotIn("hunter2", out)
+                self.assertTrue(out.startswith(f"{kq}{name}=<REDACTED>"), out)
+                self.assertTrue(out.endswith(term), out)
+
+
+class RedactionSparesCode(unittest.TestCase):
+    """A key-name followed by a FUNCTION CALL is redacted whole, never left dangling.
+
+    `brokerApiKey: resolveKey("LITELLM_API_KEY"),` was being rewritten to
+    `brokerApiKey=<REDACTED>LITELLM_API_KEY"),` and handed to the model, which
+    then reported a "broken hunk" on a line that compiles, as a blocking
+    finding, round after round. Leaving calls alone was the first fix and was
+    wrong: `password=hunter2(prod)` is call-shaped too, and a redactor that
+    skips it leaks. So a call is consumed through its closing paren and
+    replaced like any other value. Nothing dangles; nothing leaks.
+    """
+
+    def test_identifier_call_is_redacted_whole_with_nothing_dangling(self):
+        out = claude_review.redact('brokerApiKey: resolveKey("LITELLM_API_KEY"),')
+        self.assertEqual("brokerApiKey=<REDACTED>,", out)
+
+    def test_dotted_call_is_redacted_whole(self):
+        out = claude_review.redact('apiKey: settings.resolve("X"),')
+        self.assertEqual("apiKey=<REDACTED>,", out)
+
+    def test_a_nested_call_is_consumed_two_levels_deep(self):
+        self.assertEqual("token=<REDACTED>;", claude_review.redact('token = resolveKey(env("X"));'))
+        self.assertEqual("password=<REDACTED>", claude_review.redact("password = a(b(c(d)))"))
+
+    def test_a_secret_abutting_a_paren_is_redacted_not_leaked(self):
+        # The case that made "leave calls alone" wrong: call-shaped, and a secret.
+        self.assertEqual("password=<REDACTED>", claude_review.redact("password=hunter2(prod)"))
+        self.assertEqual("PASSWORD=<REDACTED>", claude_review.redact("PASSWORD=Summer(2024)!"))
+        self.assertEqual("password=<REDACTED>", claude_review.redact("password=hunter2[prod]"))
+
+    def test_a_subscript_a_suffix_run_and_a_command_substitution_go_the_same_way(self):
+        # Consume, never skip: a subscript, a run of suffixes, `$(cmd)` and a
+        # parenthesised value are redacted whole, not left dangling and not
+        # left to the model.
+        cases = {
+            'token = os.environ["TOKEN"]': "token=<REDACTED>",
+            'token = d["a"]["b"]': "token=<REDACTED>",
+            "token = f(x)[0]": "token=<REDACTED>",
+            "token = f(x)(y), z": "token=<REDACTED>, z",
+            "TOKEN=$(gcloud auth print-access-token)": "TOKEN=<REDACTED>",
+            "password=(x)": "password=<REDACTED>",
+            # `=>` before a call must not fall back to `=` plus a `>` value.
+            "'password' => getenv(\"DB_PASSWORD\"),": "'password=<REDACTED>,",
+        }
+        for line, want in cases.items():
+            with self.subTest(line=line):
+                self.assertEqual(claude_review.redact(line), want)
+
+    def test_literals_are_still_redacted(self):
+        self.assertIn("<REDACTED>", claude_review.redact("api_key=abc123"))
+        self.assertIn("<REDACTED>", claude_review.redact('password: "hunter the second"'))
+        self.assertNotIn("hunter", claude_review.redact('password: "hunter the second"'))
+
+    def test_env_ref_value_is_still_redacted(self):
+        # $FOO / ${FOO} are values, not calls; a secret pulled from env in a
+        # shell line is still a secret on the wire.
+        self.assertIn("<REDACTED>", claude_review.redact("token=$MY_TOKEN"))
+        self.assertEqual(claude_review.redact("token=${MY_TOKEN}"), "token=<REDACTED>")
+
+    def test_a_json_quoted_key_whose_value_is_a_call_is_redacted_whole(self):
+        # The JSON form (`"apiKey": ...`) takes the same path; the key's own
+        # closing quote is consumed with the separator, as for every JSON value.
+        out = claude_review.redact('"brokerApiKey": resolveKey("LITELLM_API_KEY"),')
+        self.assertEqual('"brokerApiKey=<REDACTED>,', out)
+
+    def test_a_secret_followed_by_a_parenthetical_is_still_redacted(self):
+        # A space before the paren is not a call; the word is the secret and the
+        # parenthetical is prose that stays.
+        self.assertEqual(
+            "password=<REDACTED> (rotated weekly)",
+            claude_review.redact("password=hunter2 (rotated weekly)"),
+        )
+
+    def test_a_literal_default_inside_a_call_goes_with_the_call(self):
+        # Redacting the call whole closes the gap that skipping it left open: a
+        # literal passed as an argument is inside the redacted span.
+        out = claude_review.redact('apiKey = getEnv("API_KEY", "hunter2")')
+        self.assertEqual("apiKey=<REDACTED>", out)
+        self.assertNotIn("hunter2", out)
+
+    def test_a_call_broken_across_lines_falls_back_to_the_bare_form(self):
+        # Rare, and a display cost only: the first line's fragment is redacted,
+        # nothing on it leaks, the continuation is left as it was.
+        out = claude_review.redact('apiKey: resolveKey(\n  "X"),')
+        self.assertNotIn("resolveKey(", out)
+        self.assertIn("<REDACTED>", out)
+
+    def test_the_nesting_boundary_is_three_paren_levels(self):
+        # Three levels are consumed whole. Four fall back to the bare form:
+        # the closing parens dangle and a literal argument at that depth stays
+        # visible. Pinned so the depth limit is a stated number, not a guess.
+        self.assertEqual("apiKey=<REDACTED>", claude_review.redact("apiKey: a(b(c(ENV)))"))
+        four_deep = claude_review.redact("password = a(b(c(d(e))))")
+        self.assertEqual("password=<REDACTED>))))", four_deep)
+        literal_four_deep = claude_review.redact('apiKey: a(b(c(d("X"))))')
+        self.assertEqual('apiKey=<REDACTED>"X"))))', literal_four_deep)
+
+    def test_a_quote_that_closes_an_enclosing_string_is_not_eaten(self):
+        # The bare-token branch took any trailing quote, so `x('api_key=abc123')`
+        # came out as `x('api_key=<REDACTED>)`: an unterminated literal in the
+        # diff the model sees, which it reported as "the test files are
+        # syntactically broken" on every PR whose tests carry a fixture. A
+        # trailing quote is the value's own only when a leading one opened it.
+        self.assertEqual("x('api_key=<REDACTED>')", claude_review.redact("x('api_key=abc123')"))
+        self.assertEqual('f("token=<REDACTED>")', claude_review.redact('f("token=abc123")'))
+        # The unterminated-quote fallback still takes its own leading quote.
+        self.assertEqual("password=<REDACTED>", claude_review.redact('password="hunter2'))
+
+    def test_the_punctuation_after_a_bare_value_is_code(self):
+        # No secret contains `,`, `;` or `)`; the code around a value does.
+        cases = {
+            "login(password=pw, user=u)": "login(password=<REDACTED>, user=u)",
+            "login(password=get_pw(), user=u)": "login(password=<REDACTED>, user=u)",
+            "connect(host=h, password=pw)": "connect(host=h, password=<REDACTED>)",
+            "$password = hunter2;": "$password=<REDACTED>;",
+            "password: hunter2, user: bob": "password=<REDACTED>, user: bob",
+            # A match arm is redacted, an accepted over-redaction, call or not.
+            "token => x,": "token=<REDACTED>,",
+            "token => parse(x),": "token=<REDACTED>,",
+        }
+        for line, want in cases.items():
+            with self.subTest(line=line):
+                self.assertEqual(claude_review.redact(line), want)
+
+
+class RedactionIsLinear(unittest.TestCase):
+    """redact() runs on every PR diff before the model sees it, so a pathological
+    hunk must cost time proportional to its size, never a hang.
+
+    The three value alternatives start with different characters and every
+    lookahead is one bounded scan, so no quantifier has two ways to consume a
+    character. The bound here is loose on purpose (a 1 MB input takes well
+    under a second on a laptop); catastrophic backtracking takes minutes, and
+    that is the regression this pins.
+    """
+
+    def test_a_pathological_input_redacts_in_linear_time(self):
+        shapes = {
+            "unbalanced parens after the key": "password=" + "(" * 200_000,
+            "unbalanced parens before the key": "(" * 200_000 + "password=x",
+            "deep nesting": "password=a" + "(" * 100_000 + ")" * 100_000,
+            "unterminated quote then a megabyte": 'password: "' + "a" * 1_000_000,
+            "a megabyte of backslashes": 'password: "' + "\\" * 1_000_000,
+            "a megabyte of doubled quotes": 'password: "' + '""' * 500_000,
+            "a call with a megabyte of arguments": "password=f(" + "a," * 500_000 + ")",
+            "many keys, many spaces": "password: " * 200_000,
+            "a long type union": "password: " + "str | " * 100_000 + "x",
+            "many bare type words": "password: " + "str " * 200_000,
+        }
+        for label, text in shapes.items():
+            with self.subTest(shape=label):
+                started = time.perf_counter()
+                claude_review.redact(text)
+                self.assertLess(time.perf_counter() - started, 10.0, label)
+
+
+class RedactionSparesTypeAnnotations(unittest.TestCase):
+    """`password: str` is an annotation, not a secret.
+
+    Every typed Python signature and TS parameter matched the key=value rule,
+    and the reviewer then reported the file as syntactically broken
+    (`async (_token: string) => {}` came out as `_token=<REDACTED>`). A closed
+    set of type words is never a secret; a typed DEFAULT is a value and goes
+    whole, so nothing that was masked before becomes visible but the word.
+    """
+
+    def test_a_bare_type_word_is_an_annotation(self):
+        for line in (
+            "def login(user: str, password: str) -> None:",
+            "async (_token: string) => {}",
+            "password: str | None",
+            "password: string;",
+            "token: bytes",
+            "password: Boolean,",
+            # An absent value is not a secret either.
+            "password = None",
+            "token = null;",
+            "token = undefined",
+            "password: null",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(claude_review.redact(line), line)
+
+    def test_a_typed_default_is_redacted_whole(self):
+        cases = {
+            'password: str = "hunter2"': "password=<REDACTED>",
+            "token: str | None = None": "token=<REDACTED>",
+            'password: str = os.getenv("X")': "password=<REDACTED>",
+            "password: int = 5)": "password=<REDACTED>)",
+            "api_key: str | None = None,": "api_key=<REDACTED>,",
+        }
+        for line, want in cases.items():
+            with self.subTest(line=line):
+                self.assertEqual(claude_review.redact(line), want)
+
+    def test_only_the_whole_word_is_a_type(self):
+        cases = {
+            "password: strong_pw": "password=<REDACTED>",
+            "password: stringy": "password=<REDACTED>",
+            'password: "str"': "password=<REDACTED>",
+            # A quoted literal under a secret name stays redacted: the
+            # fail-closed side of this rule.
+            '{ token: "h", keyName: "k" }': '{ token=<REDACTED>, keyName: "k" }',
         }
         for line, want in cases.items():
             with self.subTest(line=line):
@@ -437,6 +790,91 @@ class TheCeilingComesFromTheEnvironment(unittest.TestCase):
         for fine in ("", " 24000 "):
             with self.subTest(value=fine):
                 self.assertEqual(self._ceiling(fine)[1], "")
+
+
+class TheRunnerFollowsRepoVisibility(unittest.TestCase):
+    """A PUBLIC repo runs the review on GitHub-hosted runners; everything else
+    runs on the egi-vps self-hosted pool.
+
+    The org runner group excludes public repositories, so a public repo's job
+    on [self-hosted, ...] queues forever: correct labels, idle runners, and
+    cancel/reopen cannot help. Measured on claude-cert-examprep, 2026-08-22:
+    every review run after the pool move sat queued (8 h, then 12 h) while the
+    six private siblings' runs completed. GitHub-hosted minutes are free for
+    public repos, and opening the pool to them would let fork PRs run code on
+    the VPS, so public goes hosted.
+
+    The test is the string 'public' on purpose: a missing or unknown visibility
+    falls to the pool (the private default), which fails loudly on a public repo
+    rather than silently billing a private one. A bare `ubuntu-latest` is the
+    regression that spent the org's hosted minutes; a bare self-hosted list is
+    the one that stranded the public repo. Both fail here.
+    """
+
+    EXPR = (
+        "${{ github.event.repository.visibility == 'public' && 'ubuntu-latest'"
+        " || fromJSON('[\"self-hosted\",\"Linux\",\"X64\"]') }}"
+    )
+
+    @staticmethod
+    def _runs_on(path):
+        text = path.read_text(encoding="utf-8")
+        return re.findall(r"^\s*runs-on:\s*(\S.*?)\s*$", text, flags=re.M)
+
+    @staticmethod
+    def _workflows():
+        """claude-review.yml (required) and ci-standards.yml (when the repo carries
+        it). Deployed, both live in .github/workflows/, next to this test's
+        parent directory. In the kit, claude-review.yml is this file's sibling in
+        pipeline/templates/ci-bootstrap/ and ci-standards.yml is one level up in
+        pipeline/templates/: that is what the second candidate of each pair is.
+        A repo's own workflows are never read: only the two vendored files are."""
+        here = Path(__file__).resolve()
+        candidates = {
+            "claude-review.yml": (
+                here.parents[1] / "workflows" / "claude-review.yml",
+                here.with_name("claude-review.yml"),
+            ),
+            "ci-standards.yml": (
+                here.parents[1] / "workflows" / "ci-standards.yml",
+                here.parents[1] / "ci-standards.yml",
+            ),
+        }
+        found = {}
+        for name, paths in candidates.items():
+            for path in paths:
+                if path.is_file():
+                    found[name] = path
+                    break
+        return found
+
+    def setUp(self):
+        self.found = self._workflows()
+        if "claude-review.yml" not in self.found:
+            self.fail("claude-review.yml was not found beside this test")
+
+    def test_the_review_workflow_has_exactly_one_runs_on(self):
+        lines = self._runs_on(self.found["claude-review.yml"])
+        self.assertEqual(len(lines), 1, lines)
+
+    def test_ci_standards_has_two_jobs_on_the_same_line(self):
+        if "ci-standards.yml" not in self.found:
+            self.skipTest("this repo declines ci-standards")
+        lines = self._runs_on(self.found["ci-standards.yml"])
+        self.assertEqual(len(lines), 2, lines)
+
+    def test_public_goes_hosted_and_everything_else_to_the_pool(self):
+        for name, path in self.found.items():
+            for line in self._runs_on(path):
+                with self.subTest(workflow=name):
+                    self.assertEqual(line, self.EXPR)
+
+    def test_neither_bare_runner_is_accepted(self):
+        for name, path in self.found.items():
+            for line in self._runs_on(path):
+                for bare in ("ubuntu-latest", "[self-hosted, Linux, X64]"):
+                    with self.subTest(workflow=name, bare=bare):
+                        self.assertNotEqual(line, bare)
 
 
 if __name__ == "__main__":
