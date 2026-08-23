@@ -54,8 +54,11 @@ jobs:
     # free for public repos, and opening the pool to them would let fork PRs run
     # code on the VPS, so public goes hosted. The test is the string 'public' on
     # purpose: a missing or unknown visibility falls to the pool, which is the
-    # private-repo default and fails loudly on a public repo rather than silently
-    # billing a private one. test_claude_review.py pins this exact line.
+    # private-repo default and stays a visibly queued, never-green check on a
+    # public repo rather than silently billing a private one. (A queued check is
+    # loud in the sense that it never goes green, not in the sense of an
+    # immediate failure — GitHub times a job like that out, it does not fail it
+    # fast.) test_claude_review.py pins this exact line.
     runs-on: ${{ github.event.repository.visibility == 'public' && 'ubuntu-latest' || fromJSON('["self-hosted","Linux","X64"]') }}
     # Only run with secrets for same-repo PRs; fork PRs never see the key.
     if: github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository
