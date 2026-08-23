@@ -10,6 +10,13 @@
 # secret. Bootstrap-Repo / Sync-Secrets sets the repo form; a repo that opted in
 # later has to be granted the key, and the first step here fails loudly until it
 # is. Fork PRs get no secret access.
+#
+# Third-party actions are SHA-pinned, the same supply-chain rule as
+# ci-standards.yml: the tag comment is for humans, the SHA is what runs. To bump
+# one, resolve the new tag to its COMMIT with
+# `gh api repos/<owner>/<action>/commits/<tag> --jq .sha` (for an annotated tag,
+# `git/ref/tags/<tag>` is the tag object, not the commit), then update the SHA
+# and the comment together.
 name: Claude code review
 
 on:
@@ -38,7 +45,18 @@ concurrency:
 jobs:
   review:
     name: Claude code review
-    runs-on: [self-hosted, Linux, X64]
+    # Hosted for a PUBLIC repo, the egi-vps pool for everything else.
+    #
+    # The org runner group excludes public repositories, so a public repo's job
+    # on [self-hosted, ...] queues forever with correct labels and idle runners:
+    # on claude-cert-examprep every review after the pool move sat queued, 8 h
+    # and then 12 h, and cancel/reopen could not help. GitHub-hosted minutes are
+    # free for public repos, and opening the pool to them would let fork PRs run
+    # code on the VPS, so public goes hosted. The test is the string 'public' on
+    # purpose: a missing or unknown visibility falls to the pool, which is the
+    # private-repo default and fails loudly on a public repo rather than silently
+    # billing a private one. test_claude_review.py pins this exact line.
+    runs-on: ${{ github.event.repository.visibility == 'public' && 'ubuntu-latest' || fromJSON('["self-hosted","Linux","X64"]') }}
     # Only run with secrets for same-repo PRs; fork PRs never see the key.
     if: github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository
     env:
@@ -107,7 +125,7 @@ jobs:
       # workflow_dispatch has no pull request, so it falls back to the sha of
       # the ref it was dispatched on, as before.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.pull_request.base.ref || github.sha }}
           fetch-depth: 0
@@ -134,7 +152,7 @@ jobs:
 
       - name: Upload Claude review artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: claude-review-${{ github.run_id }}
           path: claude-review.md
