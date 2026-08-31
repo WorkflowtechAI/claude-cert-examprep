@@ -18,6 +18,7 @@ import re
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 MAX_REVIEW_CHARS = 120_000
@@ -1164,6 +1165,32 @@ def messages_endpoint() -> str:
     base = (os.getenv("ANTHROPIC_BASE_URL") or ANTHROPIC_DEFAULT_BASE).strip().rstrip("/")
     if not base:
         base = ANTHROPIC_DEFAULT_BASE
+    # THE KEY TRAVELS WITH THIS URL, so the host is not a formatting detail.
+    # ANTHROPIC_BASE_URL is a repo VARIABLE, which is a lower bar than a secret:
+    # anyone who can set one could point the reviewer at a box they control and
+    # ANTHROPIC_API_KEY would go with the request. Refuse rather than warn --
+    # a warning in an unattended CI log is a leak nobody reads.
+    #
+    # A scheme check, not an allowlist. This variable exists so the broker can
+    # move without editing a file vendored into every repo; an allowlist would
+    # need editing in all the same places. https is the property that matters:
+    # no plaintext egress of the key, and no http:// to an arbitrary host.
+    # LOOPBACK over plain http is allowed; nothing else is. The key cannot
+    # leave the machine to reach 127.0.0.1, and the enforcer's own endpoint
+    # check binds a loopback socket to stay network-free -- a blanket https
+    # rule breaks that test, which makes the rule wrong rather than the test.
+    #
+    # urlsplit and a hostname SET, never a prefix: "http://127.0.0.1.evil.test"
+    # starts with "http://127.0.0.1" and is not loopback. A prefix check would
+    # ship a bypass inside the fix for a bypass.
+    if not base.startswith("https://"):
+        host = urllib.parse.urlsplit(base).hostname
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            raise SystemExit(
+                f"ANTHROPIC_BASE_URL must be https:// or loopback (got: {base!r}). "
+                "The API key is sent with every request to it, so any other "
+                "non-https base is refused rather than used."
+            )
     return f"{base}/v1/messages"
 
 

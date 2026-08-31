@@ -345,6 +345,85 @@ class FileSelectionTreatsRootLikeNested(unittest.TestCase):
                         self.assertFalse(claude_review.include_file(path), path)
 
 
+class TheEndpointRefusesToLeakTheKey(unittest.TestCase):
+    """ANTHROPIC_BASE_URL decides where ANTHROPIC_API_KEY is sent.
+
+    It is a repo VARIABLE, not a secret, which is a lower bar: anyone who can
+    set one could point the reviewer at a host they control and the key would go
+    with the request. messages_endpoint() took it verbatim.
+
+    Found by a review on benesseremedestetica#12 during the rollout, and it was
+    NEW reach rather than a pre-existing gap -- the vendored copy those repos
+    carried referenced ANTHROPIC_BASE_URL zero times, so the sync is what gave
+    the variable this power.
+
+    A scheme check rather than an allowlist, deliberately: the variable exists so
+    the broker can move without editing a file vendored into every repo, and an
+    allowlist would need editing in all the same places. https is the property
+    that matters -- no plaintext egress, no http:// to an arbitrary box.
+    """
+
+    def setUp(self):
+        self._saved = os.environ.get("ANTHROPIC_BASE_URL")
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        if self._saved is None:
+            os.environ.pop("ANTHROPIC_BASE_URL", None)
+        else:
+            os.environ["ANTHROPIC_BASE_URL"] = self._saved
+
+    def test_the_default_is_https_and_is_accepted(self):
+        os.environ.pop("ANTHROPIC_BASE_URL", None)
+        self.assertEqual(claude_review.messages_endpoint(),
+                         "https://api.anthropic.com/v1/messages")
+
+    def test_an_https_override_is_accepted(self):
+        os.environ["ANTHROPIC_BASE_URL"] = "https://llm.example.test/"
+        self.assertEqual(claude_review.messages_endpoint(),
+                         "https://llm.example.test/v1/messages")
+
+    def test_plain_http_is_refused_not_warned(self):
+        # Refused, because a warning in an unattended CI log is a leak nobody
+        # reads. The message names the offending value so the fix is obvious.
+        os.environ["ANTHROPIC_BASE_URL"] = "http://attacker.example.test"
+        with self.assertRaises(SystemExit) as caught:
+            claude_review.messages_endpoint()
+        self.assertIn("https://", str(caught.exception))
+
+    def test_a_schemeless_host_is_refused_too(self):
+        # The shape most likely to be typed by accident, and the one that would
+        # otherwise produce a request to a relative-looking host.
+        os.environ["ANTHROPIC_BASE_URL"] = "llm.example.test"
+        with self.assertRaises(SystemExit):
+            claude_review.messages_endpoint()
+
+    def test_loopback_over_plain_http_is_allowed(self):
+        # The carve-out exists because the enforcer's own endpoint check binds
+        # a loopback socket to stay network-free. The key cannot leave the
+        # machine to reach 127.0.0.1, so http there is not egress.
+        for base in ("http://127.0.0.1:8931", "http://localhost:8931"):
+            with self.subTest(base=base):
+                os.environ["ANTHROPIC_BASE_URL"] = base
+                self.assertEqual(claude_review.messages_endpoint(), f"{base}/v1/messages")
+
+    def test_a_loopback_LOOKALIKE_is_still_refused(self):
+        # THE CARVE-OUT MUST NOT BE A PREFIX MATCH. Every one of these starts
+        # with a loopback-looking string and resolves somewhere else entirely.
+        # Shipping a bypass inside the fix for a bypass is the failure this
+        # case exists to make impossible.
+        for base in (
+            "http://127.0.0.1.evil.example",
+            "http://localhost.evil.example",
+            "http://127.0.0.1@evil.example",
+            "http://evil.example/127.0.0.1",
+        ):
+            with self.subTest(base=base):
+                os.environ["ANTHROPIC_BASE_URL"] = base
+                with self.assertRaises(SystemExit):
+                    claude_review.messages_endpoint()
+
+
 class RedactionLeavesTheCodeParseable(unittest.TestCase):
     """Every exact-output case above pins ONE line. This pins the PROPERTY they
     were all supposed to have, and that three of them silently asserted the
@@ -1369,11 +1448,55 @@ class TheRunnerFollowsRepoVisibility(unittest.TestCase):
         "${{ github.event.repository.visibility == 'public' && 'ubuntu-latest'"
         " || fromJSON('[\"self-hosted\",\"Linux\",\"X64\"]') }}"
     )
+    # THE FORK-GATED FORM, for jobs that run repo code rather than only calling
+    # an API. Keying on visibility alone let a fork PR against a PRIVATE repo
+    # run on the self-hosted pool. claude-review.yml does not need it -- it
+    # gates forks out at the job level instead. Whitespace-normalised, because
+    # it is written as a folded scalar to stay inside the column limit.
+    FORK_GATED = (
+        "${{ (github.event.repository.visibility == 'public'"
+        " || (github.event.pull_request.head.repo.full_name"
+        " && github.event.pull_request.head.repo.full_name != github.repository))"
+        " && 'ubuntu-latest'"
+        " || fromJSON('[\"self-hosted\",\"Linux\",\"X64\"]') }}"
+    )
+    ACCEPTED = (EXPR, FORK_GATED)
 
     @staticmethod
     def _runs_on(path):
-        text = path.read_text(encoding="utf-8")
-        return re.findall(r"^\s*runs-on:\s*(\S.*?)\s*$", text, flags=re.M)
+        """Every runs-on value, with folded scalars joined as YAML would.
+
+        STDLIB ONLY, deliberately. This file is vendored into repos that are not
+        guaranteed to have PyYAML, so a `yaml.safe_load` here would make a
+        travelling single-file test depend on a package its host may not
+        install. Raised in review on kit #193.
+
+        A raw regex is not enough either: the fork-gated jobs write the
+        expression as `runs-on: >-` over several lines, and a line match returns
+        `>-` instead of the value. Folding those continuation lines with spaces
+        is precisely what the scalar means, so this compares what the runner
+        actually receives.
+        """
+        found = []
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped.startswith("runs-on:"):
+                continue
+            value = stripped[len("runs-on:"):].strip()
+            if value not in (">-", ">", "|", "|-"):
+                found.append(value)
+                continue
+            indent = len(line) - len(line.lstrip())
+            parts = []
+            for cont in lines[i + 1:]:
+                if not cont.strip():
+                    break
+                if len(cont) - len(cont.lstrip()) <= indent:
+                    break
+                parts.append(cont.strip())
+            found.append(" ".join(parts))
+        return found
 
     @staticmethod
     def _workflows():
@@ -1421,7 +1544,7 @@ class TheRunnerFollowsRepoVisibility(unittest.TestCase):
         for name, path in self.found.items():
             for line in self._runs_on(path):
                 with self.subTest(workflow=name):
-                    self.assertEqual(line, self.EXPR)
+                    self.assertIn(line, self.ACCEPTED)
 
     def test_neither_bare_runner_is_accepted(self):
         for name, path in self.found.items():
