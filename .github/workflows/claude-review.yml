@@ -60,10 +60,32 @@ jobs:
     # immediate failure — GitHub times a job like that out, it does not fail it
     # fast.) test_claude_review.py pins this exact line.
     runs-on: ${{ github.event.repository.visibility == 'public' && 'ubuntu-latest' || fromJSON('["self-hosted","Linux","X64"]') }}
-    # Only run with secrets for same-repo PRs; fork PRs never see the key.
-    if: github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository
+    # Two guards, and they answer different questions.
+    #
+    # SECRETS: only same-repo PRs run with the key; fork PRs never see it.
+    #
+    # DRAFTS: a push to a draft PR is not reviewed. A draft cannot merge, so
+    # reviewing each push to one spends on a diff nobody can ship — and
+    # iterate-in-draft is exactly where pushes cluster. Nothing is lost:
+    # `ready_for_review` is in the trigger list above, so marking a PR ready
+    # reviews the state that can actually merge, and every push after that is
+    # reviewed as before.
+    #
+    # Measured in the kit before this: 27 review runs in one day against a
+    # $5/day capped key at ~$0.18 a review — the ceiling almost exactly. Most
+    # were legitimate re-reviews of real changes and worth their cost. The draft
+    # ones were not.
+    if: >-
+      (github.event_name != 'pull_request_target' ||
+       github.event.pull_request.head.repo.full_name == github.repository) &&
+      github.event.pull_request.draft != true
     env:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # Route reviews through a LiteLLM broker so CI spend sits under a capped
+      # virtual key. Unset, the script calls Anthropic directly, as before. A
+      # repository VARIABLE, not a secret: a base URL is not sensitive, and a
+      # secret here would hide which host a review actually hit.
+      ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }}
       CLAUDE_REVIEW_MODEL: ${{ vars.CLAUDE_REVIEW_MODEL || 'claude-sonnet-5' }}
       # Per-repo ceiling without editing this vendored file: set a repository
       # variable. Unset, the script uses its own default (empty string fails
@@ -210,6 +232,13 @@ jobs:
             empty)
               echo "::error::The Claude review returned no text. This is a tooling failure," \
                    "not a clean bill of health. See the posted comment for stop_reason."
+              exit 1
+              ;;
+            failed)
+              echo "::error::The Claude review did not run: the API returned an error, so no" \
+                   "part of this diff was reviewed. The posted comment carries the status code" \
+                   "and the response body. A spending ceiling on the key and a rate limit both" \
+                   "arrive as 429, and the body says which."
               exit 1
               ;;
             *)
