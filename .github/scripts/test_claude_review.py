@@ -17,12 +17,14 @@ discover .github/scripts` or `python .github/scripts/test_claude_review.py`.
 
 import ast
 import contextlib
+import http.server
 import importlib.util
 import io
 import itertools
 import json
 import os
 import re
+import threading
 import time
 import unittest
 import urllib.error
@@ -403,6 +405,35 @@ class TheEndpointRefusesToLeakTheKey(unittest.TestCase):
         # a loopback socket to stay network-free. The key cannot leave the
         # machine to reach 127.0.0.1, so http there is not egress.
         for base in ("http://127.0.0.1:8931", "http://localhost:8931"):
+            with self.subTest(base=base):
+                os.environ["ANTHROPIC_BASE_URL"] = base
+                self.assertEqual(claude_review.messages_endpoint(), f"{base}/v1/messages")
+
+    def test_the_scheme_test_is_case_insensitive(self):
+        # RFC 3986 s3.1: schemes are case-insensitive. The old check was
+        # `base.startswith("https://")`, so these all fell through to the
+        # loopback branch and SystemExited on a legitimate endpoint. It failed
+        # closed -- a spurious refusal, never a leak -- but the message it
+        # produced named https:// while rejecting an https URL.
+        for base in ("HTTPS://api.anthropic.com", "HttpS://api.anthropic.com",
+                     "HTTPS://llm.workflowtech.ai"):
+            with self.subTest(base=base):
+                os.environ["ANTHROPIC_BASE_URL"] = base
+                self.assertEqual(claude_review.messages_endpoint(), f"{base}/v1/messages")
+
+    def test_a_case_variant_scheme_does_not_smuggle_a_non_loopback_host(self):
+        # The case fix must not become a way past the host check: HTTP:// is
+        # still not https, so it still has to be loopback to be allowed.
+        for base in ("HTTP://evil.example", "HtTp://api.anthropic.com",
+                     "HTTP://127.0.0.1.evil.example"):
+            with self.subTest(base=base):
+                os.environ["ANTHROPIC_BASE_URL"] = base
+                with self.assertRaises(SystemExit):
+                    claude_review.messages_endpoint()
+
+    def test_loopback_over_a_case_variant_http_is_still_allowed(self):
+        for base in ("HTTP://127.0.0.1:8931", "HTTP://localhost:8931",
+                     "Http://LOCALHOST:8931"):
             with self.subTest(base=base):
                 os.environ["ANTHROPIC_BASE_URL"] = base
                 self.assertEqual(claude_review.messages_endpoint(), f"{base}/v1/messages")
@@ -1236,6 +1267,836 @@ class ReenteringRedactIsLoud(unittest.TestCase):
         self.assertEqual('token="<REDACTED>"', claude_review.redact("token=abc123"))
 
 
+class NoCombinationOfShapesLeaksALiteral(unittest.TestCase):
+    """THE ANSWER TO "EVERY FIX FOUND ITS NEIGHBOUR ONE ROUND LATER".
+
+    Four leaks were fixed in this file in one week, and each was found only
+    after the previous fix shipped: spaced concatenation missed the unspaced
+    form, the prefixed VALUE missed the prefixed OPERAND, the tempered bare
+    class missed the chain's call form, and the operator set missed the bare
+    class that has to stop in front of it. Every one was the NEIGHBOUR of
+    something already tested, missed because the pins were written from the
+    example that motivated the change and inherited its incidental properties.
+    Every pin in this file had spaces around the operator, because the shape
+    that prompted them did.
+
+    A generator does not have incidental properties. This walks the product of
+    the axes the pattern actually branches on and asserts, for every one, that
+    the sentinel does not survive.
+
+    THE ORACLE IS ONE-SIDED, which is what makes this cheap and worth having.
+    There is no need to know the correct output for 392,400 lines -- only that
+    the secret is gone from each. Over-redaction is not tested here (the exact
+    -output classes above do that); this asks the single question the file
+    exists to answer.
+
+    ZERO IS THE BASELINE, not a recorded count. Every combination these axes
+    produce is covered, so a leak here is a regression rather than a known gap.
+    Shapes that are still known to leak -- adjacency with no operator,
+    subscript assignment, positional secrets, escaped quotes inside an
+    enclosing string -- are deliberately NOT generated: they are recorded in
+    HARNESS.md and #188, and generating them would mean pinning a nonzero
+    baseline that hides a real regression inside an accepted one.
+    """
+
+    SECRET = "AbCdEf0123456789ZzYyXx"
+
+    NAMES = ["api_key", "token", "password", "client_secret", '"api_key"']
+    SEPARATORS = [":", "=", ":=", "=>", "+=", ".="]
+    SPACING = ["", " "]
+    PREFIXES = ["", "f", "b", "$"]
+    QUOTES = ['"', "'", "`"]
+    OPERATORS = [None, "+", ".", "..", "&", "%", "||", "??", " or ", " and "]
+    # TWO AXES, NOT ONE. This was a single `OPERAND_SPACING` applied to both
+    # sides of the operator, so every generated case was symmetric and the
+    # asymmetric leak (`pre+ "SECRET"` -- glued left, spaced right) was outside
+    # the product entirely. Review on #192 found by hand what the generator
+    # could not express. An axis that cannot represent the asymmetry cannot
+    # find it, which is the hand-written pin's blind spot one level up.
+    SPACE_BEFORE_OP = ["", " "]
+    SPACE_AFTER_OP = ["", " "]
+    LEADS = ["", "pre", "f()"]
+    CONTEXTS = [("", ""), ("f(", ")"), ('f("', '")'), ("{ ", " }"), ("+  ", "")]
+
+    def cases(self):
+        # itertools.product, not nine nested `for`s. The nested form worked and
+        # then pushed its innermost line past the vendored-file column limit the
+        # moment an axis was split in two -- a layout that cannot survive its own
+        # axes growing. The product also makes the axis list the only place a
+        # dimension is declared, so adding one cannot silently skip a level.
+        axes = itertools.product(
+            self.NAMES, self.SEPARATORS, self.SPACING, self.PREFIXES,
+            self.QUOTES, self.OPERATORS, self.SPACE_BEFORE_OP,
+            self.SPACE_AFTER_OP, self.LEADS, self.CONTEXTS,
+        )
+        for name, sep, sp, prefix, quote, op, pre_sp, post_sp, lead, ctx in axes:
+            before, after = ctx
+            literal = f"{prefix}{quote}{self.SECRET}{quote}"
+            if op is None:
+                # No operator means no operand and no spacing around one; the
+                # other combinations would be the same case many times over.
+                if lead or pre_sp or post_sp:
+                    continue
+                value = literal
+            else:
+                left = lead or f"{prefix}{quote}pre{quote}"
+                value = f"{left}{pre_sp}{op}{post_sp}{literal}"
+            yield f"{before}{name}{sp}{sep}{sp}{value}{after}"
+
+    def test_the_generator_actually_generates(self):
+        # A CHECK THAT SCANNED NOTHING IS NOT A PASS. The loop above is nine
+        # deep and one wrong `continue` empties it silently.
+        count = sum(1 for _ in self.cases())
+        self.assertGreater(count, 100_000, "the axes stopped producing cases")
+
+    def test_the_sentinel_survives_nothing(self):
+        leaked = []
+        for line in self.cases():
+            if self.SECRET in claude_review.redact(line):
+                leaked.append(line)
+                if len(leaked) >= 12:
+                    break
+        if leaked:
+            self.fail(
+                f"{len(leaked)}+ generated shapes leak the literal; first few:\n  "
+                + "\n  ".join(f"{shape}\n    -> {claude_review.redact(shape)}" for shape in leaked)
+            )
+
+    def test_it_finishes_in_a_time_a_suite_can_afford(self):
+        # It runs on every PR alongside everything else. Measured at ~1.2s for
+        # the full product; the ceiling is loose so a slow machine is not a
+        # red build, and a pattern that went quadratic still shows up here.
+        started = time.perf_counter()
+        for line in self.cases():
+            claude_review.redact(line)
+        self.assertLess(time.perf_counter() - started, 30.0)
+class ATransportFailurePostsRatherThanCrashing(unittest.TestCase):
+    """A read timeout killed the process before it could say so.
+
+    `call_claude` caught only `urllib.error.HTTPError`, so a read timeout, a
+    reset connection, a DNS failure or a TLS error propagated out of `main()`
+    and took `write_status()` with it. The workflow caught THAT correctly -- "No
+    Claude review status was written, so nothing proves a review ran", red
+    rather than green -- but the promise the error branch makes, that the posted
+    comment carries the reason, was not kept: there was no comment, and the
+    reason lived in a stack trace in the job log.
+
+    Measured on kit #192 on 2026-08-31: `TimeoutError: The read operation timed
+    out` after 5m17s, no comment, no status file, and a red check whose message
+    said only that nothing proved a review ran.
+
+    THE SAME LINE HAD ALREADY BEEN FIXED TWICE BY RAISING THE TIMEOUT, 60s then
+    300s. Both treated the symptom -- the review got slower, so the ceiling
+    moved -- and left the class, which is that any network exception took the
+    status file with it. A third raise would have been the third symptom fix in
+    a row on one line.
+    """
+
+    def _call_with(self, exc):
+        # No response body here on purpose: `side_effect=exc` makes the call
+        # RAISE, so nothing is ever read back. A leftover payload dict from the
+        # returning version of this test sat here unused until ruff named it.
+        with mock.patch.object(claude_review._NO_REDIRECT_OPENER, "open", side_effect=exc):
+            with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "k"}, clear=False):
+                return claude_review.call_claude("diff text")
+
+    def test_a_read_timeout_returns_a_failure_banner(self):
+        out = self._call_with(TimeoutError("The read operation timed out"))
+        self.assertIn(claude_review.FAILED_BANNER, out)
+        self.assertIn("TimeoutError", out)
+        self.assertIn("transport failure", out)
+
+    def test_every_transport_failure_takes_the_same_path(self):
+        # OSError is the net rather than a list of names, so a shape nobody has
+        # met yet lands here too.
+        for exc in (
+            TimeoutError("timed out"),
+            ConnectionResetError("reset by peer"),
+            claude_review.urllib.error.URLError("name resolution failed"),
+            OSError("something the stdlib has not named yet"),
+        ):
+            with self.subTest(exc=type(exc).__name__):
+                out = self._call_with(exc)
+                self.assertIn(claude_review.FAILED_BANNER, out)
+
+    def test_the_banner_is_the_one_the_status_reader_recognises(self):
+        # The whole point: the workflow decides the check colour from the
+        # status, and the status is read off this banner. A failure that does
+        # not carry it reads as a review that ran.
+        #
+        # THROUGH `status_for`, WHICH IS WHAT main() CALLS -- not
+        # `review_status`. The first draft of this test used the latter and
+        # failed with 'ok', because call_claude returns the posted COMMENT
+        # (heading and all) while review_status classifies the review TEXT.
+        # That is the seam status_for's own docstring was written about, and
+        # asserting the wrong half of it would have passed a green check on an
+        # unreviewed diff straight through.
+        out = self._call_with(TimeoutError("timed out"))
+        self.assertEqual(claude_review.STATUS_FAILED, claude_review.status_for(out))
+
+    def test_an_http_error_still_takes_the_more_specific_handler(self):
+        # HTTPError subclasses URLError and therefore OSError, so the order of
+        # the two handlers is load-bearing: catching OSError first would swallow
+        # every HTTP failure and lose the status code with it.
+        exc = claude_review.urllib.error.HTTPError(
+            "https://example.invalid", 429, "Too Many Requests", {},
+            io.BytesIO(b'{"error":{"type":"budget_exceeded"}}'),
+        )
+        out = self._call_with(exc)
+        self.assertIn("HTTP 429", out)
+        self.assertIn("budget_exceeded", out)
+        self.assertNotIn("transport failure", out)
+
+
+class AnUnparseableBodyReportsRatherThanCrashing(unittest.TestCase):
+    """The answer arriving is not the same as the answer being readable.
+
+    The transport handlers catch the CALL failing. They do not catch the BODY
+    being unreadable: `json.loads` raises JSONDecodeError and `.decode` raises
+    UnicodeDecodeError, both ValueError and neither an OSError. So a proxy error
+    page, a truncated response or a gateway's HTML propagated out of `main()`
+    and took `write_status()` with it -- the identical crash-before-status-write
+    that the transport fix in this same PR closed for sockets.
+
+    Raised in review on #197, on the commit that fixed the transport half. The
+    same defect wearing a different exception type, which is the fourth time
+    this file has met "fixed the shape, missed its neighbour" in one week.
+    """
+
+    def _answer_with(self, payload):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return payload
+
+        with mock.patch.object(
+            claude_review._NO_REDIRECT_OPENER, "open", return_value=Response()
+        ):
+            with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "k"}, clear=False):
+                return claude_review.call_claude("diff")
+
+    def test_a_proxy_error_page_reports_instead_of_crashing(self):
+        body = self._answer_with(b"<html><body>502 Bad Gateway</body></html>")
+        self.assertIn(claude_review.FAILED_BANNER, body)
+        self.assertEqual(claude_review.STATUS_FAILED, claude_review.status_for(body))
+
+    def test_the_body_that_did_not_parse_is_shown(self):
+        # "unparseable" is not actionable; a Cloudflare page and a truncated
+        # JSON body look nothing alike, and the difference is the diagnosis.
+        body = self._answer_with(b"<html>upstream connect error</html>")
+        self.assertIn("upstream connect error", body)
+
+    def test_a_truncated_json_body_takes_the_same_path(self):
+        body = self._answer_with(b'{"content":[{"type":"text","text":"half')
+        self.assertIn(claude_review.FAILED_BANNER, body)
+        self.assertEqual(claude_review.STATUS_FAILED, claude_review.status_for(body))
+
+    def test_undecodable_bytes_take_it_too(self):
+        # UnicodeDecodeError is a ValueError, so one handler covers both without
+        # naming either -- the same reason OSError is the net for transport.
+        body = self._answer_with(b"\xff\xfe\x00not utf-8 at all")
+        self.assertIn(claude_review.FAILED_BANNER, body)
+        self.assertEqual(claude_review.STATUS_FAILED, claude_review.status_for(body))
+
+    def test_a_good_body_still_reviews(self):
+        # The guard must not swallow the happy path.
+        body = self._answer_with(
+            b'{"content":[{"type":"text","text":"looks fine"}],'
+            b'"stop_reason":"end_turn"}'
+        )
+        self.assertIn("looks fine", body)
+        self.assertEqual(claude_review.STATUS_OK, claude_review.status_for(body))
+
+
+class ThreeMoneyFailuresAreThreeDifferentSentences(unittest.TestCase):
+    """A cap, a ceiling and an empty account are fixed by different people.
+
+    They arrive as three different statuses and the message has to tell them
+    apart, because the operator's next action differs in each case:
+
+        429 + budget_exceeded  the team DAILY cap  -> wait, or raise the cap
+        402                    a per-key ceiling   -> raise the key's ceiling
+        400 + credit balance   the provider account is EMPTY -> add credit
+
+    The third had no branch until 2026-09-01, when it stopped every review and
+    every agent constraint across the repo and the posted comment said only
+    "HTTP 400 from the API" with the reason nested two JSON levels down inside
+    an escaped string. The hint list on offer was "401 or 403 is the key, 402
+    is the budget", none of which matched. Diagnosing it meant reading the
+    nested string by hand.
+    """
+
+    # The body as the broker actually sent it during the outage, escaping and
+    # all -- a fixture invented from the docs would not have the nesting that
+    # made this hard to read in the first place.
+    REAL_BODY = (
+        '{"error":{"message":"{\\"type\\":\\"error\\",\\"error\\":'
+        '{\\"type\\":\\"invalid_request_error\\",\\"message\\":'
+        '\\"Your credit balance is too low to access the Anthropic API. '
+        'Please go to Plans & Billing to upgrade or purchase credits.\\"}}. '
+        'Received Model Group=claude-sonnet-5","code":"400"}}'
+    )
+
+    def _hint_for(self, code, body):
+        error = urllib.error.HTTPError(
+            "https://llm.example.invalid/v1/messages", code, "nope", {},
+            io.BytesIO(body.encode("utf-8")),
+        )
+        with mock.patch.object(
+            claude_review._NO_REDIRECT_OPENER, "open", side_effect=error
+        ):
+            with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "k"}, clear=False):
+                return claude_review.call_claude("diff")
+
+    def test_an_empty_provider_account_says_so(self):
+        out = self._hint_for(400, self.REAL_BODY)
+        self.assertIn(claude_review.FAILED_BANNER, out)
+        self.assertEqual(claude_review.STATUS_FAILED, claude_review.status_for(out))
+        self.assertIn("upstream account being empty", out)
+        self.assertIn("Add credit", out)
+
+    def test_it_says_what_will_NOT_help(self):
+        # The two things an operator reaches for first, named as useless, so
+        # nobody spends an hour re-running a job that cannot pass.
+        out = self._hint_for(400, self.REAL_BODY)
+        self.assertIn("No re-run will clear it", out)
+        self.assertIn("no ceiling can be raised past it", out)
+
+    def test_a_per_key_ceiling_is_still_its_own_sentence(self):
+        out = self._hint_for(402, '{"error":{"message":"budget exceeded"}}')
+        self.assertIn("spending ceiling on the key", out)
+        self.assertNotIn("Add credit", out)
+
+    def test_the_daily_cap_is_still_its_own_sentence(self):
+        out = self._hint_for(
+            429, '{"error":{"type":"budget_exceeded","message":"Budget has been exceeded"}}'
+        )
+        self.assertIn("spending ceiling", out)
+        self.assertNotIn("Add credit", out)
+
+    def test_the_detector_reads_the_body_not_the_status(self):
+        # The status is the BROKER's; the reason is the PROVIDER's. Nothing
+        # about 400 distinguishes an empty account from a malformed request.
+        self.assertTrue(claude_review.is_upstream_credit_exhausted(self.REAL_BODY))
+        self.assertTrue(
+            claude_review.is_upstream_credit_exhausted("insufficient credit remaining")
+        )
+        self.assertFalse(claude_review.is_upstream_credit_exhausted(""))
+        self.assertFalse(
+            claude_review.is_upstream_credit_exhausted("model not found: claude-x"),
+        )
+
+    def test_a_redirect_is_a_redirect_whatever_its_body_says(self):
+        """Status beats body when the status is the one thing that cannot lie.
+
+        Both `"budget" in detail` and `is_upstream_credit_exhausted(detail)`
+        classify on text, and a 3xx body is not a provider verdict -- the
+        broker never reached the provider. With the credit branch sitting
+        above the redirect branch, a redirect whose body happened to carry
+        either word was reported as a money problem, and the operator would
+        top up an account over a base-URL mistake. Raised in review on #204
+        against the credit branch; the `budget` branch had the same hole, so
+        the fix is the ordering rather than a code guard on each.
+        """
+        for phrase in ("Your credit balance is too low", "budget exceeded"):
+            for code in (301, 302, 307, 308):
+                with self.subTest(code=code, phrase=phrase):
+                    out = self._hint_for(code, f'{{"message":"{phrase}"}}')
+                    self.assertIn("answered with a redirect", out)
+                    self.assertNotIn("Add credit", out)
+                    self.assertNotIn("spending ceiling", out)
+
+    def test_the_money_branches_still_fire_on_their_own_statuses(self):
+        # Reordering fixes by exclusion, so prove it excluded only redirects:
+        # the same two phrases on a non-3xx status must still be classified.
+        self.assertIn("Add credit", self._hint_for(400, self.REAL_BODY))
+        self.assertIn(
+            "spending ceiling", self._hint_for(402, '{"message":"budget exceeded"}')
+        )
+
+    def test_a_budget_body_is_not_a_credit_body(self):
+        # Folding them together would tell the operator to top up an account
+        # when the fix is to raise a cap. Different money, different person.
+        self.assertFalse(
+            claude_review.is_upstream_credit_exhausted(
+                '{"error":{"type":"budget_exceeded","message":"Budget has been exceeded!"}}'
+            )
+        )
+
+
+class TheKeyDoesNotFollowARedirect(unittest.TestCase):
+    """`messages_endpoint()` validated the destination and not the journey.
+
+    urllib's default redirect handler copies every header but `content-length`
+    and `content-type` onto the new request, so `x-api-key` rides along. A
+    validated https endpoint answering 302 therefore hands the API key to
+    whatever host the redirect names -- the residual half of the exact threat
+    the endpoint check was written for.
+
+    MEASURED THREE WAYS on 2026-08-31 before the fix: the handler in isolation
+    returned a Request for `evil.example` carrying the sentinel; two loopback
+    servers showed the redirect TARGET receiving it verbatim; and the opener
+    below raised instead, with the target receiving nothing.
+
+    These tests use REAL SOCKETS on the loopback interface rather than a mock,
+    because the claim is about what urllib does and a mock of urllib cannot
+    testify to that. They bind port 0, serve one request, and shut down.
+    """
+
+    def _serve(self, handler_cls):
+        server = http.server.HTTPServer(("127.0.0.1", 0), handler_cls)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        return server.server_address[1]
+
+    def _endpoints(self):
+        """A redirector that points at a collector which records its headers."""
+        seen = {}
+
+        class Collector(http.server.BaseHTTPRequestHandler):
+            def _record(inner):
+                seen.update({k.lower(): v for k, v in inner.headers.items()})
+                inner.send_response(200)
+                inner.send_header("content-type", "application/json")
+                inner.end_headers()
+                inner.wfile.write(b'{"content":[{"type":"text","text":"x"}]}')
+
+            # A 302 replays a POST as a GET, so both have to answer or the test
+            # fails on its own shape rather than on the property.
+            do_POST = _record
+            do_GET = _record
+
+            def log_message(inner, *a):
+                pass
+
+        collector_port = self._serve(Collector)
+
+        class Redirector(http.server.BaseHTTPRequestHandler):
+            def do_POST(inner):
+                inner.send_response(302)
+                inner.send_header(
+                    "Location", f"http://127.0.0.1:{collector_port}/collect"
+                )
+                inner.end_headers()
+
+            def log_message(inner, *a):
+                pass
+
+        return seen, self._serve(Redirector)
+
+    def test_the_default_handler_would_have_forwarded_the_key(self):
+        # The vulnerability, asserted rather than described, so the fix below is
+        # not protecting against something nobody demonstrated.
+        request = urllib.request.Request(
+            "https://llm.example.invalid/v1/messages",
+            data=b"{}",
+            headers={"x-api-key": "SENTINEL", "content-type": "application/json"},
+            method="POST",
+        )
+        forwarded = urllib.request.HTTPRedirectHandler().redirect_request(
+            request, None, 302, "Found", {}, "https://evil.example/collect"
+        )
+        self.assertEqual("evil.example", forwarded.host)
+        self.assertIn("SENTINEL", str(dict(forwarded.headers)))
+
+    def test_the_opener_refuses_the_redirect_and_the_target_gets_nothing(self):
+        seen, redirector_port = self._endpoints()
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{redirector_port}/v1/messages",
+            data=b"{}",
+            headers={"x-api-key": "SENTINEL", "content-type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            claude_review._NO_REDIRECT_OPENER.open(request, timeout=10)
+        self.assertEqual(302, caught.exception.code)
+        self.assertEqual({}, seen, "the redirect target received a request at all")
+
+    def test_a_refused_redirect_reports_as_a_failure_and_says_why(self):
+        # It lands in the HTTPError handler, so it is STATUS_FAILED -- blocking,
+        # visible in the posted comment, and carrying the reason rather than a
+        # bare status code.
+        error = urllib.error.HTTPError(
+            "https://llm.example.invalid/v1/messages", 302, "Found", {},
+            io.BytesIO(b""),
+        )
+        with mock.patch.object(
+            claude_review._NO_REDIRECT_OPENER, "open", side_effect=error
+        ):
+            with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "k"}, clear=False):
+                body = claude_review.call_claude("diff")
+        self.assertIn(claude_review.FAILED_BANNER, body)
+        self.assertEqual(claude_review.STATUS_FAILED, claude_review.status_for(body))
+        self.assertIn("redirect", body.lower())
+        self.assertIn("NOT sent onward", body)
+
+
+class AVendorKeyIsRecognisedWithoutParsingTheLine(unittest.TestCase):
+    """The half of the table that does not care where the value sits.
+
+    Everything in the key=value rule PARSES SYNTAX to find a value position, and
+    every leak found in the week of 2026-08-31 was there -- spacing, prefixes,
+    operands, backticks, escaped quotes, fallback operators, subscript
+    assignment, positional arguments. Eight classes of it are still open.
+
+    These entries ask a different question: not "where is the value" but "is
+    this string a key". No quoting form can hide from that, which is why a
+    secret the parser cannot reach is still caught here.
+
+    A PREFIX, NOT AN ENTROPY THRESHOLD, and the difference was measured. Against
+    the shapes the parser misses, carrying real credential formats: a tuned
+    entropy rule caught 14% and redacted 0.079% of the repo's lines, a loose one
+    caught 57% and redacted 9.9%, and vendor prefixes caught 75% at 0.008%.
+    Prefixes win on BOTH axes because a prefix is a literal string -- nothing
+    that is not a GitHub token begins `ghp_` -- while entropy collides with git
+    SHAs, UUIDs, content hashes and base64 assets.
+    """
+
+    # THESE USED TO READ AS `"<REDACTED>"` IN A REVIEWED DIFF. MOSTLY THEY NO
+    # LONGER DO, AND THAT IS A FIX, NOT A REGRESSION.
+    #
+    # The history matters because it cost real review time. These fixtures are
+    # vendor keys and the code under test detects vendor keys, so `redact()` ate
+    # them on the way to the model. Two review rounds on #196 were shown
+    # `"<REDACTED>"`, reasonably concluded the fixture was placeholder text, and
+    # the second reported it as a BLOCKING bug. Both readings were correct about
+    # what they had been shown, which is what made it expensive.
+    #
+    # SPLITTING THE LITERALS FIXED IT, as a side effect of fixing something else.
+    # Written as `"ghp_" + "16C7..."` the SOURCE line carries no contiguous
+    # vendor shape, so the redactor leaves it alone and the reviewer sees the
+    # real fixture -- while the RUNTIME value is byte-identical, so the detectors
+    # still fire and not one assertion moves. The split was forced by GitHub push
+    # protection refusing the push (#209); this fell out of it. Measured against
+    # main's redactor: seven of eight now reach the model intact.
+    #
+    # THE EIGHTH REDACTED ON ITS LABEL, NOT ITS VALUE. `redact()` fires on names
+    # as well as values, so `"Stripe secret"` was eaten for the word `secret`
+    # however the value was written. It is now `"Stripe live key"`. Nothing keys
+    # on the label -- VENDOR_SAMPLES is only ever walked as
+    # `for label, value in ...` -- so this changes no assertion, and it is the
+    # rename that takes the class to eight of eight.
+    #
+    # WHAT WOULD ACTUALLY BE WRONG, and is the thing to check instead: a literal
+    # `"<REDACTED>"` fixture would FAIL these tests, not pass them. That string
+    # matches no vendor prefix, so it survives `redact()` unchanged, and the
+    # assertion is `assertNotIn(value, redact(line))`. A placeholder cannot hide
+    # here -- the suite going green is itself the proof the fixtures are real.
+    #
+    # If a fixture DOES still reach you redacted, that is the redactor working,
+    # not a placeholder. Verify with
+    # `git show <sha>:.github/scripts/test_claude_review.py` rather than by
+    # asking for the value to be changed.
+    #
+    # Structure is real; the bytes are not. None of these is a live key.
+    VENDOR_SAMPLES = {
+        "Stripe live key": "sk_live_" + "4eC39HqLyjWDarjtT1zdp7dc",
+        "GitHub PAT": "ghp_" + "16C7e42F292c6912E7710c838347Ae178B4a",
+        "GitLab PAT": "glpat-" + "ABCdef123456789012345",
+        "Slack bot": "xoxb-" + "123456789012-1234567890123-aB3dEfGhIjKl",
+        "Google API": "AIza" + "SyD-aBcDeFgHiJkLmNoPqRsTuVwXyZ12345",
+        "AWS temporary": "ASIA" + "IOSFODNN7EXAMPLE",
+        "JWT": "eyJ" + "hbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVP",
+        "npm": "npm_" + "abcdefghij1234567890ABCDEFGHIJ1234",
+        "SendGrid": "SG." + "aBcDeFgHiJkLmNoPqRsTu.vWxYz1234567890abcdefghij",
+        "HuggingFace": "hf_" + "aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567",
+        "DigitalOcean": "dop_v1_" + "a1b2c3d4" * 8,
+        "Shopify": "shpat_" + "a1b2c3d4" * 4,
+        "Replicate": "r8_" + "aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890a",
+        # Added on review of #196, which asked for the package and
+        # infrastructure vendors a repo like this actually holds keys for.
+        "PyPI": "pypi-" + "AgEIcHlwaS5vcmcCJDAxMjM0NTY3ODkwYWJjZGVm",
+        "Docker Hub": "dckr_pat_" + "aBcDeFgHiJkLmNoPqRsTuVwXyZ01",
+        "Supabase": "sbp_" + "a1b2c3d4" * 5,
+        "Twilio API key": "SK" + "0123456789abcdef" * 2,
+    }
+
+    # Lines the key=value rule does NOT reach, each measured on 2026-08-31 and
+    # recorded in #188. This is where these entries earn their place: a shape
+    # the parser cannot parse is still a string these can recognise.
+    PARSER_CANNOT_REACH = (
+        'config["api_key"] = "{}"',
+        'vault.write("password", "{}")',
+        "    proxy_set_header X-Api-Key {};",
+        "ENV NPM_TOKEN {}",
+        'apiKey?: string = "{}"',
+        '  ansible_password: !unsafe {}',
+        'const apiKey = /* dev only */ "{}";',
+    )
+
+    def test_every_vendor_key_is_redacted_wherever_it_sits(self):
+        for label, value in self.VENDOR_SAMPLES.items():
+            for shape in self.PARSER_CANNOT_REACH:
+                line = shape.format(value)
+                with self.subTest(vendor=label, shape=shape):
+                    self.assertNotIn(value, claude_review.redact(line))
+
+    def test_the_shapes_really_are_beyond_the_key_value_rule(self):
+        # A CHECK THAT SCANNED NOTHING IS NOT A PASS. If the parser started
+        # covering these, the test above would pass without the vendor entries
+        # doing anything, and would quietly stop testing them. A value with no
+        # vendor prefix must still survive every one of these shapes.
+        plain = "correcthorsebatterystaple"
+        for shape in self.PARSER_CANNOT_REACH:
+            line = shape.format(plain)
+            with self.subTest(shape=shape):
+                self.assertIn(
+                    plain, claude_review.redact(line),
+                    "the key=value rule now reaches this shape, so it no longer "
+                    "proves the vendor entries did the work",
+                )
+
+    def test_the_vendor_is_still_named_in_the_output(self):
+        # The replacement keeps the prefix, as `sk-<REDACTED>` and
+        # `AKIA<REDACTED>` already did: "you leaked a GitHub token" is worth
+        # more to a reviewer than "you leaked something".
+        sample = "ghp_" + "16C7e42F292c6912E7710c838347Ae178B4a"
+        out = claude_review.redact(f'x = "{sample}"')
+        self.assertIn("ghp_<REDACTED>", out)
+
+    def test_an_identifier_is_not_a_secret(self):
+        """Twilio's ACCOUNT SID is published in dashboards and request URLs.
+
+        Redacting it would cost a reviewer a line it can legitimately read and
+        hide nothing, which is the same reasoning that keeps Stripe's
+        publishable `pk_` key out of the table. The API KEY SID above is a
+        different string and is redacted.
+        """
+        sid = "AC" + "0123456789abcdef0123456789abcdef"
+        line = f'account_sid = "{sid}"'
+        self.assertEqual(line, claude_review.redact(line))
+
+    def test_a_word_that_merely_ends_with_a_prefix_is_left_alone(self):
+        """`TASK` + 32 hex is not a Twilio key, and used to be redacted as one.
+
+        Raised in review on #196 against the `SK` entry, whose two characters
+        make the collision easy to see. The measurement said it was not an `SK`
+        bug: none of the twenty entries anchored its prefix, so every one of
+        them matched mid-identifier. The boundary went on at the build site,
+        and this pins the case that named it.
+        """
+        for word in ("TASK", "MASK", "FLASK", "SUBTASK"):
+            line = f"{word}0123456789abcdef0123456789abcdef"
+            with self.subTest(word=word):
+                self.assertEqual(line, claude_review.redact(line))
+
+    def test_no_vendor_prefix_matches_inside_a_longer_word(self):
+        """The whole table, not the one entry review happened to look at.
+
+        A real credential never acquires a leading identifier character, so a
+        sample that still matches with one glued on is a rule that will blank
+        benign tokens. This ran 20-of-20 before the fix.
+        """
+        for label, value in self.VENDOR_SAMPLES.items():
+            with self.subTest(vendor=label):
+                glued = f"ENV SOME_TOKEN X{value}"
+                self.assertEqual(glued, claude_review.redact(glued))
+
+    def test_the_boundarys_own_blind_spot_is_pinned_not_assumed(self):
+        """What the word boundary costs, asserted so the doc cannot drift.
+
+        Raised in review on #196. Excluding `[A-Za-z0-9_]` means a key glued
+        to a leading identifier is no longer seen by this half. That is the
+        price of not blanking `TASK` + 32 hex, and it is worth pinning in
+        BOTH directions so a future widening of the class shows up here as a
+        failure rather than as a silent change of behaviour.
+        """
+        key = "ghp_" + "16C7e42F292c6912E7710c838347Ae178B4a"
+        # Glued to an identifier: this half does not reach it.
+        for line in (f"SOMEVAR_{key}", f"SOMEVAR{key}", f"MYVAR=SOMEVAR_{key}"):
+            with self.subTest(missed=line):
+                self.assertIn(key, claude_review.redact(line))
+        # But a hyphen is not an identifier character, so this one IS caught --
+        # the deliberate asymmetry, kept biased toward over-redaction.
+        self.assertNotIn(key, claude_review.redact(f"some-{key}"))
+        # And the OTHER half still reaches a glued key under a known name.
+        self.assertNotIn(key, claude_review.redact(f'token = "SOMEVAR_{key}"'))
+
+    def test_the_boundary_did_not_switch_the_detectors_off(self):
+        """The other half of the pin, because a boundary can fix by breaking.
+
+        `assertEqual(line, redact(line))` above passes just as happily if the
+        entry stopped matching anything at all. So assert the same samples in
+        the same shape WITHOUT the glued character are still eaten.
+        """
+        for label, value in self.VENDOR_SAMPLES.items():
+            with self.subTest(vendor=label):
+                line = f"ENV SOME_TOKEN {value}"
+                self.assertNotIn(value, claude_review.redact(line))
+
+    def test_the_prefixless_credentials_are_named_not_covered(self):
+        """The honest half of the claim, asserted rather than assumed.
+
+        An AWS SECRET access key, a Twilio auth token and a raw hex credential
+        carry no distinguishing prefix, so nothing here reaches them and the
+        table must not be read as if it did. If one of these ever starts being
+        redacted, the comment above `_VENDOR_KEYS` has become wrong and should
+        be corrected rather than left to flatter the coverage.
+        """
+        for label, value in (
+            ("AWS secret access key", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+            ("Twilio auth token", "0123456789abcdef0123456789abcdef"),
+            ("raw hex credential", "9f86d081884c7d659a2feaa0c55ad015"),
+        ):
+            with self.subTest(label=label):
+                line = f"# see the runbook, value {value}"
+                self.assertEqual(line, claude_review.redact(line))
+
+    def test_every_entry_has_exactly_one_group_for_the_replacement(self):
+        # The replacement is `\1<REDACTED>`, so an entry with no group raises at
+        # substitution time and an entry with two silently keeps the wrong half.
+        for pattern in claude_review._VENDOR_KEYS:
+            with self.subTest(pattern=pattern):
+                self.assertEqual(
+                    1, re.compile(pattern).groups,
+                    "each vendor entry captures exactly the prefix",
+                )
+
+    # NO CROSS-COPY TEST HERE, AND THAT IS NOT AN OVERSIGHT. The kit's suite
+    # carries `test_the_two_copies_carry_the_same_vendors`, which imports this
+    # file and compares the compiled `_VENDOR_KEYS`. This copy cannot mirror it:
+    # it travels to bootstrapped repos that have no kit tree to compare against,
+    # and a test that silently finds nothing to check is worse than no test --
+    # it is the "scanned nothing and passed" shape this suite exists to refuse.
+    # The comparison belongs in the copy that can see both. Raised in review on
+    # #196, which noticed the asymmetry and was right to ask.
+    def test_what_it_deliberately_leaves_alone(self):
+        # A git SHA and a UUID are the collision an entropy rule cannot resolve
+        # and a prefix rule never meets. Stripe's PUBLISHABLE key is public by
+        # design, so redacting it would hide nothing and cost the reviewer a
+        # line it may legitimately need.
+        for line in (
+            "# pinned at da39a3ee5e6b4b0d3255bfef95601890afd80709",
+            "id = 550e8400-e29b-41d4-a716-446655440000",
+            'stripe.publishable = "pk_live_4eC39HqLyjWDarjtT1zdp7dc"',
+            "Bearer tokens are described in the README.",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(line, claude_review.redact(line))
+
+
+class AVariableReshapingItselfCarriesNothingNew(unittest.TestCase):
+    r"""`token = token.strip()` has no literal to hide.
+
+    The name matches, so the rule fired; the right-hand side is the SAME
+    variable with methods called on it. Whatever the value is, it was already in
+    the variable a line earlier -- and redacting it corrupts control logic in
+    the text the model reads:
+
+        token = token.strip().strip("'\"")
+        ->  token="<REDACTED>""'\"")
+
+    Measured on kit #200, where the model then reported that corruption as a
+    BLOCKING SyntaxError -- accurately -- on a file that compiles and whose
+    suite was green in the same CI run. A CORRECT READING OF A WRONG INPUT is
+    the worst failure this table has, because nothing in the review can answer
+    it: the reviewer is right about what it was shown.
+    """
+
+    def assertUnchanged(self, line):
+        self.assertEqual(line, claude_review.redact(line))
+
+    def assertRedacted(self, line):
+        self.assertIn("<REDACTED>", claude_review.redact(line))
+
+    def test_a_reshape_of_the_same_name_survives(self):
+        for line in (
+            "token = token.strip()",
+            "key = key.lower()",
+            "token = token[1:]",
+            "secret = secret.split(\",\")[0]",
+            "api_key = api_key.replace(\"-\", \"\")",
+            "password = password.strip().strip(\"'\\\"\")",
+        ):
+            with self.subTest(line=line):
+                self.assertUnchanged(line)
+
+    def test_a_different_name_is_an_ordinary_value(self):
+        # The backreference is the whole safety argument: a LOOKALIKE is not
+        # the same variable, and its contents are unknown to this line.
+        for line in (
+            "token = other.strip()",
+            "token = token_source.strip()",
+            "token = source_token.strip()",
+        ):
+            with self.subTest(line=line):
+                self.assertRedacted(line)
+
+    def test_a_literal_after_the_chain_is_still_a_literal(self):
+        """The regression this exemption nearly shipped.
+
+        With whitespace allowed as a terminator, `token = token.strip() or
+        "hunter2"` matched the chain, hit the space, and went exempt WITH THE
+        LITERAL STILL ON THE LINE -- an exemption written to stop a false
+        finding, turning a redacted line into a leak. Caught by measuring
+        before pushing, and pinned so it cannot come back.
+        """
+        for line in (
+            'token = token.strip() or "AbCdEf0123456789ZzYyXx"',
+            'token = token.strip() + "AbCdEf0123456789ZzYyXx"',
+            'token = token.strip() & "AbCdEf0123456789ZzYyXx"',
+        ):
+            with self.subTest(line=line):
+                self.assertNotIn("AbCdEf0123456789ZzYyXx", claude_review.redact(line))
+
+    def test_a_ternary_still_leaks_and_that_is_not_this_exemptions_doing(self):
+        """A PRE-EXISTING gap, pinned here so the next reader does not blame the
+        exemption above for it.
+
+        The chain follows `||`, `??`, `or` and `and`; it does not follow a
+        ternary. So the value ends at the condition and the else-branch literal
+        survives. MEASURED IDENTICAL BEFORE AND AFTER this exemption, and it
+        happens for `other.lower()` and a bare `x` just the same, which is what
+        proves the exemption is not involved -- the first draft of the test
+        above asserted this line was redacted, and it never was.
+
+        Recorded in HARNESS.md's residual list rather than fixed here: a
+        ternary is a third operand shape and belongs with the other unfollowed
+        forms, not bolted onto a fix for something else.
+        """
+        for line in (
+            'password = password.lower() if x else "AbCdEf0123456789ZzYyXx"',
+            'password = other.lower() if x else "AbCdEf0123456789ZzYyXx"',
+            'password = x if y else "AbCdEf0123456789ZzYyXx"',
+        ):
+            with self.subTest(line=line):
+                self.assertIn(
+                    "AbCdEf0123456789ZzYyXx", claude_review.redact(line),
+                    "the ternary is now followed -- good, but HARNESS.md and "
+                    "this test still say it is not, and one of them is wrong",
+                )
+
+    def test_a_long_literal_argument_is_not_punctuation(self):
+        # `.strip("'\"")` and `.split(",")` are punctuation and stay exempt. An
+        # argument carrying an eight-character alphanumeric run is doing
+        # something other than trimming, and is redacted.
+        self.assertRedacted('token = token.replace("AbCdEf0123456789ZzYyXx", "")')
+        self.assertUnchanged('token = token.split(",")')
+
+    def test_the_name_must_match_whole_and_a_prefix_does_not(self):
+        # The key group matches the TAIL of a name, so `client_secret` is
+        # matched as `secret` and the backreference then looks for `secret`
+        # where the value says `client_secret`. Not exempt -- over-redaction,
+        # and the safe direction. Pinned so the behaviour is recorded rather
+        # than rediscovered as a bug.
+        self.assertRedacted('client_secret = client_secret.encode("utf-8")')
+
+    def test_an_ordinary_secret_is_untouched_by_any_of_this(self):
+        for line in (
+            'token = "AbCdEf0123456789ZzYyXx"',
+            "password: hunter2",
+            'api_key = get_key("AbCdEf0123456789ZzYyXx")',
+        ):
+            with self.subTest(line=line):
+                self.assertRedacted(line)
+
+
 class RedactionIsLinear(unittest.TestCase):
     """redact() runs on every PR diff before the model sees it, so a pathological
     hunk must cost time proportional to its size, never a hang.
@@ -1307,6 +2168,50 @@ class RedactionIsLinear(unittest.TestCase):
             # each fail late is its own shape.
             "prefixed near-operands": "password=" + '+ab"x' * 200_000,
             "prefixes with no literal after them": "password=" + "+ab" * 300_000,
+            # The operator set grew (`%`, `||`, `??`, `or`, `and`) and the
+            # bare-boundary lookahead grew with it, so the new members get their
+            # own shapes rather than inheriting the confidence of the old ones.
+            # Raised in review on #192; measured worst case 0.40s.
+            #
+            # THESE LINES ARE UNREADABLE IN A REVIEWED DIFF, AND THAT IS THE
+            # REDACTOR WORKING. Each one is `password=` followed by a
+            # concatenation, so `redact()` takes it whole and the line reaches
+            # the model as `"label": "password=<REDACTED>" * 300_000` -- with
+            # the operator it exists to stress edited out. Two review rounds on
+            # #192 read that and reported the payloads as stale copy-paste,
+            # which is the correct reading of what they were shown.
+            #
+            # It cannot be fixed by renaming: a shape that does not start with a
+            # key the table knows never enters the rule these tests exist to
+            # stress. So it is said here instead, in the hunk itself, where the
+            # next reviewer will be looking. Verify with
+            # `git show <sha>:.github/scripts/test_claude_review.py`, not the diff.
+            "a megabyte of || with no literal": "password=" + "a||" * 300_000,
+            "|| each followed by a near-literal": "password=" + '||"a' * 200_000,
+            "?? repeated": "password=" + "a??" * 300_000,
+            "% repeated": "password=" + "a%" * 400_000,
+            "word operators repeated": "password=" + "a or " * 200_000,
+            "and repeated": "password=" + "a and " * 200_000,
+            "mixed operator soup": "password=" + "a||b??c%d or " * 80_000,
+            # And the backtick, the newest quote character.
+            "a backtick never closed": "password=`" + "a" * 1_000_000,
+            "many backtick literals": "password=" + "`a`+" * 200_000,
+            "nested backtick interpolation": "password=`${`" * 100_000,
+            # THE SELF-RESHAPE CHAIN, whose `(?:...|...)+` is the one nested
+            # quantifier in this file and so the only shape here that could
+            # backtrack exponentially. Raised in review on #201, which asked
+            # for a linear-time test before the alternation merged.
+            #
+            # The last two are the ones that matter. A chain that MATCHES is
+            # cheap however long it is; a chain that matches and then fails at
+            # the terminator is what makes an engine try every way of splitting
+            # the `+` -- so they end in `!`, which `(?=[,;)\]}]|[ \t]*$)` does
+            # not accept, and in an unclosed call the inner group cannot close.
+            "a long self-reshape chain": "token=token" + ".strip" * 100_000,
+            "subscript chain": "token=token" + "[0]" * 100_000,
+            "alternating attribute and subscript": "token=token" + ".a[0]" * 60_000,
+            "chain that fails at the terminator": "token=token" + ".a" * 100_000 + "!",
+            "chain of unclosed calls": "token=token" + ".a(" * 100_000,
         }
         for label, text in shapes.items():
             with self.subTest(shape=label):
@@ -1455,7 +2360,8 @@ class TheRunnerFollowsRepoVisibility(unittest.TestCase):
     # it is written as a folded scalar to stay inside the column limit.
     FORK_GATED = (
         "${{ (github.event.repository.visibility == 'public'"
-        " || (github.event.pull_request.head.repo.full_name"
+        " || ((github.event_name == 'pull_request'"
+        " || github.event_name == 'pull_request_target')"
         " && github.event.pull_request.head.repo.full_name != github.repository))"
         " && 'ubuntu-latest'"
         " || fromJSON('[\"self-hosted\",\"Linux\",\"X64\"]') }}"
@@ -1698,7 +2604,7 @@ class AReviewThatDidNotRunIsNotAPass(unittest.TestCase):
                     fp=io.BytesIO(b'{"error":{"type":"budget_exceeded"}}'),
                 )
                 raised = mock.patch.object(
-                    claude_review.urllib.request, "urlopen", side_effect=error
+                    claude_review._NO_REDIRECT_OPENER, "open", side_effect=error
                 )
                 keyed = mock.patch.dict(
                     os.environ, {"ANTHROPIC_API_KEY": "test-key"}, clear=False
@@ -1727,10 +2633,59 @@ class AReviewThatDidNotRunIsNotAPass(unittest.TestCase):
             def __exit__(self, *exc):
                 return False
 
-        with mock.patch.object(claude_review.urllib.request, "urlopen", return_value=Response()), \
-                mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}, clear=False):
+        with mock.patch.object(
+            claude_review._NO_REDIRECT_OPENER, "open", return_value=Response()
+        ), mock.patch.dict(
+            os.environ, {"ANTHROPIC_API_KEY": "test-key"}, clear=False
+        ):
             body = claude_review.call_claude("diff --git a/x b/x\n+1\n")
         self.assertEqual(claude_review.status_for(body), claude_review.STATUS_OK)
+
+    def test_a_review_with_no_key_is_not_reported_as_a_pass(self):
+        # Measured before the fix: this body matched no banner case and
+        # status_for returned "ok", which the workflow gate accepts. A Dependabot
+        # pull_request is served the Dependabot secret store and never receives
+        # ANTHROPIC_API_KEY, so "green over an unread diff" was that event's
+        # permanent state.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+            body = claude_review.call_claude("diff --git a/x b/x\n+1\n")
+        self.assertIn(claude_review.NO_KEY_BANNER, body)
+        self.assertEqual(claude_review.status_for(body), claude_review.STATUS_NO_KEY)
+        self.assertNotEqual(claude_review.status_for(body), claude_review.STATUS_OK)
+
+    def test_every_banner_constant_is_known_to_the_classifier(self):
+        """THE CLASS, not the instance.
+
+        EMPTY_BANNER, TRUNCATED_BANNER and FAILED_BANNER were constants and all
+        three had a case. The missing-key banner was a bare inline string at the
+        top of call_claude, and it was the only one the classifier did not know
+        about -- which is the entire defect, and has nothing to do with keys.
+
+        The default cannot be flipped to make this safe: a real review body is
+        arbitrary text, so OK is not positively identifiable and the fall-through
+        must stay OK. Enumerating the banners is therefore the only defence, and
+        it fails the next time someone inlines one instead of naming it.
+        """
+        banners = {
+            name: value
+            for name, value in vars(claude_review).items()
+            if name.endswith("_BANNER") and isinstance(value, str)
+        }
+        self.assertGreaterEqual(
+            len(banners), 4,
+            f"expected at least the four known banners, found {sorted(banners)}",
+        )
+        for name, banner in sorted(banners.items()):
+            with self.subTest(banner=name):
+                status = claude_review.status_for(
+                    "## Claude Code Review\n\n" + banner + " trailing detail"
+                )
+                self.assertNotEqual(
+                    status, claude_review.STATUS_OK,
+                    f"{name} classifies as OK, so a review that hit it would pass. "
+                    "Give it a case in review_status().",
+                )
 
     def test_the_workflow_fails_the_check_on_that_status(self):
         # BOTH LAYOUTS, because the suite really does travel and they differ.
@@ -2288,10 +3243,29 @@ class AConcatenatedSecretGoesWholeNotHalf(unittest.TestCase):
         value branch goes on working while an operand quietly stops matching,
         and nothing else in the suite would name the cause.
         """
-        # The prefix reaches both quote characters of the chain's literal.
+        # The prefix reaches EVERY quote character of the chain's literal.
+        # Asserted per character rather than as a count: the count was
+        # hardcoded at two and went stale the moment the backtick was added,
+        # which is the same staleness this test exists to catch, one level up.
+        prefix = claude_review._LITERAL_PREFIX
+        for quote in ('\\"', "'", "`"):
+            with self.subTest(quote=quote):
+                self.assertIn(
+                    prefix + "?" + quote, claude_review._CONCAT_LITERAL,
+                    f"the {quote} form of the chain's literal lost its prefix",
+                )
+        # DERIVED, NOT HARDCODED. This assertion has now gone stale once (it
+        # said two, and the backtick made it three), and review on #192 pointed
+        # out that replacing one hardcoded number with another only moves the
+        # staleness. Each quote branch carries exactly one prefix and exactly
+        # one `${{ }}` guard, so counting one against the other needs no
+        # number at all -- and a FOURTH quote style added without a prefix
+        # fails here, which the per-character loop above cannot catch.
         self.assertEqual(
-            2, claude_review._CONCAT_LITERAL.count(claude_review._LITERAL_PREFIX),
-            "one per quote character, or a quote style has lost its prefix",
+            claude_review._CONCAT_LITERAL.count(r"(?![ \t]*\$\{\{)"),
+            claude_review._CONCAT_LITERAL.count(prefix),
+            "a quote branch has a ${{ }} guard but no literal prefix, or the "
+            "reverse -- the two are one per quote character",
         )
         # And the chain's CALL ends the way the value branch's call ends.
         self.assertIn(claude_review._BARE_CHAR, claude_review._CONCAT_CALL)
