@@ -1737,6 +1737,74 @@ class TheKeyDoesNotFollowARedirect(unittest.TestCase):
         self.assertIn("NOT sent onward", body)
 
 
+class ATruncatedBodyStillPostsAReason(unittest.TestCase):
+    """A response cut off mid-body raised straight out of call_claude().
+
+    The `except OSError` branch was added so a transport failure -- timeout,
+    reset, DNS, TLS -- still posts a comment with the reason instead of killing
+    the process before write_status() runs. It does not cover the one failure
+    that happens AFTER a response arrives: the server sends a status line and a
+    Content-Length, then the connection closes early. http.client raises
+    IncompleteRead from response.read(), and IncompleteRead is not an OSError:
+
+        HTTPException -> Exception -> BaseException
+
+    So the same crash-before-status shape came back through a class the net did
+    not name. Raised by the reviewer on claude-cert-examprep#9, confirmed on
+    kit main, kit issue #211.
+
+    REAL SOCKET, like the redirect tests above, and for the same reason: the
+    claim is about what http.client does when a body is short, and a mock of
+    http.client cannot testify to that. The handler promises 4096 bytes and
+    sends 20. The only thing faked is messages_endpoint(), so the request
+    reaches the loopback port; that function has its own tests.
+    """
+
+    def _serve_truncated(self):
+        class Truncator(http.server.BaseHTTPRequestHandler):
+            def do_POST(inner):
+                inner.send_response(200)
+                inner.send_header("content-type", "application/json")
+                inner.send_header("content-length", "4096")
+                inner.end_headers()
+                inner.wfile.write(b'{"content":[{"type":')
+                inner.wfile.flush()
+                # Returning closes the connection with 4076 bytes still owed.
+
+            def log_message(inner, *a):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Truncator)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        return server.server_address[1]
+
+    def test_a_short_body_posts_a_failure_instead_of_raising(self):
+        port = self._serve_truncated()
+        with mock.patch.object(
+            claude_review, "messages_endpoint",
+            return_value=f"http://127.0.0.1:{port}/v1/messages",
+        ):
+            with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "k"}, clear=False):
+                # Before the fix this line raises http.client.IncompleteRead.
+                body = claude_review.call_claude("diff")
+        self.assertIn(claude_review.FAILED_BANNER, body)
+        self.assertEqual(claude_review.STATUS_FAILED, claude_review.status_for(body))
+        self.assertIn("IncompleteRead", body)
+        # The OSError sentence says no response arrived. One did. The reason
+        # posted has to say what actually happened: a body cut short.
+        self.assertIn("cut off", body.lower())
+        self.assertNotIn("no response arrived", body)
+
+    def test_the_gap_is_a_class_hierarchy_fact_not_an_opinion(self):
+        # If this ever flips, the separate branch is redundant and can fold
+        # into the OSError one. It will not flip; it is here so the reason the
+        # branch exists is a test, not a comment.
+        self.assertFalse(issubclass(http.client.IncompleteRead, OSError))
+        self.assertFalse(issubclass(http.client.HTTPException, OSError))
+
+
 class AVendorKeyIsRecognisedWithoutParsingTheLine(unittest.TestCase):
     """The half of the table that does not care where the value sits.
 
@@ -1774,14 +1842,17 @@ class AVendorKeyIsRecognisedWithoutParsingTheLine(unittest.TestCase):
     # real fixture -- while the RUNTIME value is byte-identical, so the detectors
     # still fire and not one assertion moves. The split was forced by GitHub push
     # protection refusing the push (#209); this fell out of it. Measured against
-    # main's redactor: seven of eight now reach the model intact.
+    # main's redactor: all seventeen reach the model intact. (A first pass
+    # measured eight lines and found seven; the six that push protection never
+    # forced -- JWT, npm, HuggingFace, Replicate, PyPI, Docker Hub -- were still
+    # contiguous and still eaten, and were split in the same commit.)
     #
-    # THE EIGHTH REDACTED ON ITS LABEL, NOT ITS VALUE. `redact()` fires on names
+    # ONE REDACTED ON ITS LABEL, NOT ITS VALUE. `redact()` fires on names
     # as well as values, so `"Stripe secret"` was eaten for the word `secret`
     # however the value was written. It is now `"Stripe live key"`. Nothing keys
     # on the label -- VENDOR_SAMPLES is only ever walked as
     # `for label, value in ...` -- so this changes no assertion, and it is the
-    # rename that takes the class to eight of eight.
+    # rename that takes the class to seventeen of seventeen.
     #
     # WHAT WOULD ACTUALLY BE WRONG, and is the thing to check instead: a literal
     # `"<REDACTED>"` fixture would FAIL these tests, not pass them. That string
@@ -2028,6 +2099,34 @@ class AVariableReshapingItselfCarriesNothingNew(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertRedacted(line)
 
+    def test_a_long_literal_in_a_subscript_is_not_a_reshape(self):
+        """Rule (3) says no ARGUMENT may carry a long alphanumeric run. The
+        regex applied that to the call branch and never to the subscript
+        branch, so `token = token["AbCdEfGh12345678"]` was read as a harmless
+        reshape and left on the line for the model. Raised by the reviewer on
+        gestalt-workframe-edu#609; measured on kit main before filing (#212):
+        three of the seven lines below leaked, and the call-branch control
+        showed the guard working where it existed.
+
+        An index, a slice and a short key are still what the exemption is FOR.
+        """
+        literal = "AbCdEfGh12345678"
+        for line in (
+            f'token = token["{literal}"]',
+            f"token = token['{literal}']",
+            f'token = token.strip()["{literal}"]',
+        ):
+            with self.subTest(line=line):
+                self.assertRedacted(line)
+        for line in (
+            "token = token[0]",
+            "token = token[4:]",
+            'token = token["id"]',
+            'secret = secret.split(",")[0]',
+        ):
+            with self.subTest(line=line):
+                self.assertUnchanged(line)
+
     def test_a_literal_after_the_chain_is_still_a_literal(self):
         """The regression this exemption nearly shipped.
 
@@ -2156,6 +2255,14 @@ class RedactionIsLinear(unittest.TestCase):
             ),
             "many call operands chained": 'password="x"' + " + f(a)" * 100_000,
             "an unbalanced subscript operand": 'password="x" + a[' + "(" * 200_000,
+            # The subscript branch of the reshape exemption gained the same
+            # lookahead the call branch has (kit #212). Each bracket's scan is
+            # bounded by its own closing bracket, so a chain of them must stay
+            # linear; these are the shapes that would show it if it did not.
+            "a reshape of two hundred thousand subscripts": "token = token" + "[0]" * 200_000,
+            "a reshape of many short-keyed subscripts": "token = token" + '["ab"]' * 100_000,
+            "a reshape subscript that never closes": 'token = token["' + "a" * 1_000_000,
+            "a reshape subscript with a megabyte inside": 'token = token["' + "a" * 500_000 + '"]',
             "a concat operand with a megabyte of arguments": (
                 'password="x" + f(' + "a," * 500_000 + ")"
             ),
