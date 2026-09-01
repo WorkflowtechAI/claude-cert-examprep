@@ -81,6 +81,11 @@ jobs:
       github.event.pull_request.draft != true
     env:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # GitHub sets github.actor. The gate below must key its exemption on THIS
+      # and never on ANTHROPIC_API_KEY being empty: "no key" is also what a
+      # broken secret looks like, and excusing that is how seven constraints
+      # reported green for three days on 2026-08-27.
+      IS_DEPENDABOT: ${{ github.actor == 'dependabot[bot]' }}
       # Route reviews through a LiteLLM broker so CI spend sits under a capped
       # virtual key. Unset, the script calls Anthropic directly, as before. A
       # repository VARIABLE, not a secret: a base URL is not sensitive, and a
@@ -222,6 +227,24 @@ jobs:
           case "$status" in
             ok|skipped)
               echo "Claude review status: $status"
+              ;;
+            no-key)
+              # The reviewer had no key, so it read nothing. Whether that blocks
+              # depends on whether anyone COULD fix it -- and that is the actor,
+              # never the key's absence. A Dependabot pull_request is served the
+              # Dependabot secret store and can never be given ANTHROPIC_API_KEY,
+              # so no commit its author pushes would help. Everyone else can fix
+              # the key, so for them this is a failure.
+              if [ "${IS_DEPENDABOT:-false}" = "true" ]; then
+                echo "::notice::No Claude review ran: a Dependabot PR is never given" \
+                     "Actions secrets, so ANTHROPIC_API_KEY does not exist on this run" \
+                     "and no author action can create it. NOT a pass -- this diff was" \
+                     "not reviewed."
+              else
+                echo "::error::The Claude review did not run: ANTHROPIC_API_KEY is not" \
+                     "set, so no part of this diff was reviewed. Set the secret and re-run."
+                exit 1
+              fi
               ;;
             truncated)
               echo "::error::The Claude review hit its output-token ceiling and is incomplete," \
