@@ -211,9 +211,54 @@ _PATTERN_OR_PLACEHOLDER = (
     r"(?=[\"'\s,;)\]]|$)"
 ) % {"I": _REGEX_IDIOM, "B": _REGEX_BODY}
 
+# A VARIABLE RESHAPING ITSELF CARRIES NOTHING NEW.
+#
+#     token = token.strip().strip("'\"")
+#     ->  token="<REDACTED>""'\"")
+#
+# The name matches, so the rule fires; the right-hand side is the SAME variable
+# with method calls on it. There is no literal to hide -- whatever the value is,
+# it was already in the variable a line earlier -- and redacting it corrupts
+# control logic in the text the model reads. On kit #200 the model then reported
+# that corruption as a BLOCKING SyntaxError, accurately, on a file that compiles
+# and whose suite was green in the same run. A correct reading of a wrong input
+# is the worst failure this table has, because it is unanswerable without the
+# blob.
+#
+# NARROWED SO IT CANNOT HIDE A VALUE.
+# (1) The value must OPEN with the same identifier the key matched -- a
+#     backreference, not a lookalike, so `token = token_source.strip()` and
+#     `token = other.strip()` are ordinary values and still redact.
+# (2) Only method calls and subscripts may follow, and the chain must END the
+#     value. `token = token.strip() or "hunter2"` has a literal after the chain,
+#     so it is not exempt and the literal still goes.
+# (3) NO ARGUMENT MAY CARRY A LONG ALPHANUMERIC RUN. `.strip("'\"")` and
+#     `.split(",")` are punctuation and stay exempt; `.replace("hunter2abc", "")`
+#     is a literal in an argument and is redacted. Eight characters is the bar,
+#     the same order as the vendor entries below, and deliberately low: an
+#     argument that long is doing something other than trimming.
+#
+# `db_password = db_password.strip()` is NOT exempt, because the key group
+# matches the tail (`password`) and the backreference then looks for `password`
+# where the value says `db_password`. Over-redaction, and left alone: the safe
+# direction, and narrowing it further would mean matching the whole name.
+_SELF_RESHAPE = (
+    r"(?P=key)"
+    r"(?:\.\w+(?:\((?![^()\n]*[A-Za-z0-9]{8})[^()\n]*\))?|\[[^\[\]\n]*\])+"
+)
+
 # What the value rule refuses to treat as a value. One name so the branch that
 # uses it reads as the question it asks.
-_NAMES_NOT_VALUES = r"(?:%s|%s)" % (_ENV_LOOKUP, _PATTERN_OR_PLACEHOLDER)
+# THE CHAIN MUST END THE VALUE, and the terminator is deliberately NOT the
+# `\s` the other two branches accept. With whitespace allowed,
+# `token = token.strip() or "hunter2"` matched the chain, hit the space, and
+# went exempt WITH THE LITERAL STILL ON THE LINE -- an exemption written to stop
+# a false finding, turning a redacted line into a leak. Measured before it
+# shipped. A closer or the end of the line only, so anything following the chain
+# means the value is an expression and is redacted whole.
+_NAMES_NOT_VALUES = r"(?:%s|%s|%s(?=[,;)\]}]|[ \t]*$))" % (
+    _ENV_LOOKUP, _PATTERN_OR_PLACEHOLDER, _SELF_RESHAPE,
+)
 
 # A STRING LITERAL'S PREFIX IS PART OF THE LITERAL, and the value branch read it
 # as a bare value that happened to end where a quote began. So only the prefix
@@ -251,9 +296,20 @@ _LITERAL_PREFIX = r"(?:[A-Za-z]{1,2}|[$@])"
 # the `+`. It was named in neither this file nor HARNESS.md's list of residual
 # gaps; the entry there now says what is still not covered.
 #
-# THE OPERATORS ARE THE STRING-CONCATENATION ONES, and each was measured on a
-# line that leaked before it was added: `+` (JS, TS, Python, C#, PowerShell),
-# `.` and `..` (PHP, Lua), `&` (VBScript, and *.vbs is reviewed here).
+# THE OPERATORS ARE THE ONES A LITERAL ARRIVES THROUGH, and each was measured on
+# a line that leaked before it was added. Concatenation: `+` (JS, TS, Python,
+# C#, PowerShell), `.` and `..` (PHP, Lua), `&` (VBScript, and *.vbs is reviewed
+# here). Formatting: `%` (Python's old style). And FALLBACK: `||`, `??`, `or`,
+# `and`.
+#
+# THE FALLBACKS ARE NOT CONCATENATION and are here anyway, because
+# `const token = opts.token || "hunter2";` is the hardcoded-default-credential
+# antipattern and one of the likelier ways a real key reaches a repo. The value
+# is the whole expression, so redacting it whole is right rather than generous.
+# They reach a literal or a call and never a bare name: `token = a || b` has no
+# literal to hide, so consuming `b` would buy nothing and cost the reader the
+# name. The word forms take `[ \t]+` on both sides so `password` and `passwordor`
+# stay different names.
 #
 # `+` REACHES ANY OPERAND -- a literal, a call, a bare token. The others reach a
 # literal or a CALL and not a bare token, because they are also attribute
@@ -295,7 +351,8 @@ _LITERAL_PREFIX = r"(?:[A-Za-z]{1,2}|[$@])"
 # drift after it has happened.
 _CONCAT_LITERAL = (
     r"(?:%(P)s?\"(?![ \t]*\$\{\{)(?:[^\"\\\n]|\\.|\"\")*\""
-    r"|%(P)s?'(?![ \t]*\$\{\{)(?:[^'\\\n]|\\.|'')*')"
+    r"|%(P)s?'(?![ \t]*\$\{\{)(?:[^'\\\n]|\\.|'')*'"
+    r"|%(P)s?`(?![ \t]*\$\{\{)(?:[^`\\\n]|\\.)*`)"
 ) % {"P": _LITERAL_PREFIX}
 # ONE CHARACTER OF A BARE VALUE -- AND NOT AN OPERATOR THE CHAIN IS WAITING FOR.
 # The chain above hangs off the END of the value, so it only ever sees what the
@@ -325,9 +382,39 @@ _CONCAT_LITERAL = (
 # TWO ALTERNATIVES ON DISJOINT CHARACTER SETS, so the ordinary characters -- all
 # but three of them -- take the first branch with no lookahead at all, and only
 # a literal `+`, `.` or `&` pays for one. RedactionIsLinear pins the cost.
+# THE SYMBOL OPERATORS, ONCE. The chain below matches these, and the bare class
+# above has to stop in front of exactly these -- two spellings of one set, and
+# when the set grew (`%`, `||`, `??`) only one of them grew. That is the fourth
+# instance this week of an atom spelled twice and fixed once, so it is a shared
+# constant rather than a matching pair. The word forms (`or`, `and`) are not
+# here: they need whitespace on both sides, which a character-wise class cannot
+# express, and a bare value cannot contain one without the space that ends it.
+# `+` IS IN HERE FOR THE BOUNDARY, NOT FOR THE CHAIN. The chain spells its
+# `+` branch separately because `+` alone reaches a BARE operand and the
+# others do not, so the two cannot share one alternative. `+` still belongs in
+# this set because `_BARE_CHAR` has to stop in front of every operator the
+# chain can follow, `+` included. The chain's shared-constant branch does
+# re-match `+`, harmlessly -- the `+` alternative is first and wins. Said out
+# loud because it reads like the "spelled twice" defect this constant was
+# introduced to end, and it is the one place that is deliberate. Raised in
+# review on #192.
+_CHAIN_OP = r"(?:\.{1,2}|\|\||\?\?|[+&%])"
+
+# `[ \t]*` INSIDE THE LOOKAHEAD, because the chain allows it and this has to
+# agree with the chain or the two disagree about where a value ends. It demanded
+# the literal be GLUED to the operator, so `token = pre+ "SECRET"` -- operator
+# glued left, space right -- failed the lookahead, the `+` was eaten as part of
+# the bare token, and the chain had no operator left to attach to. Five
+# operators, five leaks, raised in review on #192.
+#
+# The generator could not find it: `OPERAND_SPACING` varied the two sides
+# TOGETHER (`{opspace}{op}{opspace}`), so every case it produced was symmetric.
+# That is the same defect as a hand-written pin inheriting the shape that
+# motivated it, one level up -- an axis that cannot express the asymmetry cannot
+# find it. The axes vary independently now.
 _BARE_CHAR = (
-    r"(?:[^\s'\",;)+.&]|(?![+.&]{1,2}%(Q)s)[+.&])"
-) % {"Q": _CONCAT_LITERAL}
+    r"(?:[^\s'\",;)+.&%%|?]|(?!%(O)s[ \t]*%(Q)s)[+.&%%|?])"
+) % {"O": _CHAIN_OP, "Q": _CONCAT_LITERAL}
 
 # A call or a subscript, as the value branch spells one, without its named group
 # -- AND ENDING THE SAME WAY IT DOES. For one round it did not: the value branch
@@ -354,11 +441,10 @@ _CONCAT_CALL = (
 _CONCAT_CHAIN = (
     r"(?:"
     r"[ \t]*\+[ \t]*(?:%(Q)s|%(F)s|(?!\$\{\{)[^\s'\",;)]+)"
-    r"|[ \t]*(?:\.{1,2}|&)[ \t]*(?:%(Q)s|%(F)s)"
+    r"|[ \t]*%(O)s[ \t]*(?:%(Q)s|%(F)s)"
+    r"|[ \t]+(?:or|and)[ \t]+(?:%(Q)s|%(F)s)"
     r"){0,64}"
-) % {"Q": _CONCAT_LITERAL, "F": _CONCAT_CALL}
-
-
+) % {"Q": _CONCAT_LITERAL, "F": _CONCAT_CALL, "O": _CHAIN_OP}
 
 
 class _LineQuoteParity:
@@ -759,6 +845,7 @@ SECRET_PATTERNS = [
                 (?P<qv>
                   "(?![ \t]*\$\{\{)(?:[^"\\\n]|\\.|"")*"
                 | '(?![ \t]*\$\{\{)(?:[^'\\\n]|\\.|'')*'
+                | `(?![ \t]*\$\{\{)(?:[^`\\\n]|\\.)*`
                 )
               | (?![-+](?:[ \t]|\r?\n|$))
                 (?(type)|(?!%(T)s[ \t]*(?:[,;)\]}:|]|\r?\n|$)))
@@ -785,6 +872,126 @@ SECRET_PATTERNS = [
         ),
         "<REDACTED_PRIVATE_KEY>",
     ),
+]
+
+# THE OTHER HALF OF THE TABLE, AND THE ONE THAT SCALES.
+#
+# Everything above this line PARSES SYNTAX to find a value position, and every
+# leak found in the week of 2026-08-31 was there: spacing, prefixes, operands,
+# backticks, escaped quotes, fallback operators, subscript assignment,
+# positional arguments. That half is unbounded -- each language, quoting form
+# and operator is another branch -- and eight classes of it are still open,
+# recorded in HARNESS.md and #188.
+#
+# The three entries above ask a different question: not "where is the value"
+# but "is this string a key". That question needs no syntax at all, so no
+# quoting form can hide from it. There were three of them; there should be
+# these.
+#
+# A PREFIX, NOT AN ENTROPY THRESHOLD, and the difference was measured rather
+# than assumed. Against the shapes the parser misses, carrying real credential
+# formats:
+#
+#     tuned entropy rule   14% caught,  0.079% of repo lines redacted
+#     loose entropy rule   57% caught,  9.9%   of repo lines redacted
+#     vendor prefixes      75% caught,  0.008% of repo lines redacted
+#
+# The prefix rule beats both entropy variants on BOTH axes -- five times the
+# recall of the affordable one, at a tenth of its cost. The reason is
+# structural: a prefix is a literal string, so nothing that is not a GitHub
+# token begins `ghp_`, while entropy is a proxy that collides with git SHAs,
+# UUIDs, content hashes, base64 assets and minified code. An earlier draft of
+# this comment recommended entropy on the strength of a 34-of-34 result; that
+# measurement used a sentinel chosen to look exactly like what the rule
+# detected, and against real key formats the same rule scored 6 of 16.
+#
+# WHAT IT STILL CANNOT SEE, and why that is not an argument against it: an AWS
+# SECRET access key (no prefix, by design), a raw hex or UUID key, and any
+# passphrase. Those are the 25%, and no regex reaches them -- TruffleHog does,
+# because it VERIFIES candidates against the vendor rather than matching them,
+# which is a thing a redactor cannot do. This is a heuristic in front of a
+# model; that is the boundary.
+#
+# The replacement keeps the prefix, as the three entries above do, because
+# "you leaked a GitHub token" is worth more to a reviewer than "you leaked
+# something".
+_VENDOR_KEYS = (
+    # GitHub: personal, OAuth, user-to-server, server-to-server, refresh.
+    r"(gh[pousr]_)[A-Za-z0-9]{36,}",
+    r"(github_pat_)[A-Za-z0-9_]{50,}",
+    r"(glpat-)[A-Za-z0-9_-]{20,}",
+    # Slack bot, user, app, refresh, legacy and configuration tokens.
+    r"(xox[baprse]-)[A-Za-z0-9-]{10,}",
+    # Google API keys and OAuth access tokens.
+    r"(AIza)[A-Za-z0-9_-]{35}",
+    r"(ya29\.)[A-Za-z0-9_-]{20,}",
+    # AWS temporary credentials; the permanent id is AKIA, above.
+    r"(ASIA)[0-9A-Z]{16}",
+    # Stripe SECRET and restricted keys. The publishable `pk_` key is public by
+    # design and is deliberately absent: redacting it would hide nothing and
+    # cost the reviewer a line it can legitimately read.
+    r"(sk_(?:live|test)_)[A-Za-z0-9]{16,}",
+    r"(rk_(?:live|test)_)[A-Za-z0-9]{16,}",
+    r"(npm_)[A-Za-z0-9]{30,}",
+    r"(dop_v1_)[a-f0-9]{64}",
+    r"(shpat_)[a-fA-F0-9]{32}",
+    r"(SG\.)[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}",
+    r"(hf_)[A-Za-z0-9]{30,}",
+    r"(r8_)[A-Za-z0-9]{37,}",
+    # A JWT, which is two dotted base64 segments after the fixed header prefix.
+    # `eyJ` is `{"` in base64, so this is the header of every one of them.
+    r"(eyJ)[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*",
+    # Raised in review on #196, which asked for the package and infrastructure
+    # vendors a repo like this actually holds credentials for.
+    r"(pypi-)[A-Za-z0-9_-]{16,}",
+    r"(dckr_pat_)[A-Za-z0-9_-]{20,}",
+    r"(sbp_)[a-f0-9]{40,}",
+    # Twilio's API Key SID. Its ACCOUNT SID (`AC` + 32 hex) is deliberately
+    # absent: an account SID is an identifier, published in dashboards and
+    # request URLs, and redacting it would cost a reviewer a line it can
+    # legitimately read for no gain. Twilio's auth TOKEN is 32 bare hex with no
+    # prefix at all and is unreachable here -- one of the shapes named below.
+    r"(SK)[0-9a-f]{32}",
+)
+
+# WHAT NO PREFIX LIST CAN REACH, named so the list is not read as coverage.
+# Anthropic and OpenAI keys are already caught by the `sk-` entry above, so they
+# are absent here rather than missing. But an AWS SECRET access key, a
+# Cloudflare API token, a Twilio auth token and any raw hex or UUID credential
+# carry no distinguishing prefix by design -- they are indistinguishable from a
+# git SHA or a content hash by shape alone, which is exactly the collision that
+# made an entropy rule unaffordable. TruffleHog reaches them because it VERIFIES
+# a candidate against the vendor rather than matching it; a redactor cannot.
+#
+# The fixed lengths on DigitalOcean and Shopify are current-format specific and
+# will stop matching if either vendor changes them. Raised in review on #196 and
+# accepted: a loose length invites collisions, and a vendor changing its token
+# format is a thing someone notices.
+
+# NO VENDOR PREFIX MATCHES MID-IDENTIFIER.
+#
+# Every entry above names a prefix and none of them anchored it, so each one
+# also fired inside a longer word: `TASK` + 32 hex matched the Twilio rule and
+# came back `TASK<REDACTED>`, as did `MASK` and `FLASK`. That is the safe
+# direction -- a benign token blanked, not a real one leaked -- but a redactor
+# that eats identifiers hands the model a diff with holes in it, and the model
+# then reviews the holes. Raised in review on #196 against the `SK` entry
+# alone; measured across the table it was 20 of 20, so the boundary is applied
+# once here rather than spelled twenty times.
+#
+# The class is word characters only. `-` is deliberately out: after a hyphen a
+# prefix genuinely begins a new token, and matching there keeps the bias toward
+# over-redaction on the one case where the two directions disagree.
+#
+# Zero-width, so `\1` is still the prefix and the one-group invariant holds.
+_NOT_MID_IDENTIFIER = r"(?<![A-Za-z0-9_])"
+
+# Built rather than written out, so a vendor is one line and the replacement
+# cannot drift from the pattern -- the failure this file met four times in one
+# week was an atom spelled twice and fixed once.
+SECRET_PATTERNS += [
+    (re.compile(_NOT_MID_IDENTIFIER + pattern), r"\1<REDACTED>")
+    for pattern in _VENDOR_KEYS
 ]
 
 
@@ -936,6 +1143,14 @@ STATUS_OK = "ok"
 STATUS_TRUNCATED = "truncated"
 STATUS_EMPTY = "empty"
 STATUS_SKIPPED = "skipped"
+# A review that could not run for want of a key. SEPARATE FROM STATUS_SKIPPED
+# on purpose: `skipped` means there was nothing to review and the gate passes
+# it, which is right for an empty diff and catastrophic for a missing key.
+# Measured before this existed: call_claude() with no key returned a "Skipped:"
+# body, review_status() fell through to STATUS_OK, and the gate accepted it --
+# a green review check over a diff nothing read.
+STATUS_NO_KEY = "no-key"
+NO_KEY_BANNER = "Skipped: `ANTHROPIC_API_KEY` is not configured."
 STATUS_FAILED = "failed"
 
 # The banners review_text_from_body writes and review_status reads. One
@@ -975,6 +1190,13 @@ def review_status(text: str) -> str:
         return STATUS_EMPTY
     if text.startswith(TRUNCATED_BANNER):
         return STATUS_TRUNCATED
+    # Before this case existed the missing-key body matched none of the banners
+    # above and fell through to STATUS_OK. THIS FUNCTION ONLY STATES THE FACT.
+    # Whether "could not run" blocks is the gate's decision, because that is
+    # where github.actor is available -- and the actor, never the key's absence,
+    # is what may excuse it.
+    if text.startswith(NO_KEY_BANNER):
+        return STATUS_NO_KEY
     return STATUS_OK
 
 
@@ -1183,8 +1405,18 @@ def messages_endpoint() -> str:
     # urlsplit and a hostname SET, never a prefix: "http://127.0.0.1.evil.test"
     # starts with "http://127.0.0.1" and is not loopback. A prefix check would
     # ship a bypass inside the fix for a bypass.
-    if not base.startswith("https://"):
-        host = urllib.parse.urlsplit(base).hostname
+    #
+    # ONE PARSE ANSWERS BOTH QUESTIONS. The scheme test used to be
+    # `base.startswith("https://")`, a byte comparison -- but URL schemes are
+    # case-insensitive (RFC 3986 s3.1), so HTTPS:// failed it, fell into the
+    # loopback branch, was not loopback, and SystemExited on a legitimate
+    # endpoint. It failed closed, so never a leak; it just produced
+    # "must be https:// (got: 'HTTPS://...')", which reads as nonsense to
+    # whoever hits it. Reading scheme and host from the SAME urlsplit also means
+    # the two can never disagree about what string they parsed.
+    parts = urllib.parse.urlsplit(base)
+    if parts.scheme.lower() != "https":
+        host = parts.hostname  # urlsplit lower-cases this already
         if host not in ("127.0.0.1", "localhost", "::1"):
             raise SystemExit(
                 f"ANTHROPIC_BASE_URL must be https:// or loopback (got: {base!r}). "
@@ -1194,10 +1426,71 @@ def messages_endpoint() -> str:
     return f"{base}/v1/messages"
 
 
+# THE KEY MUST NOT LEAVE THE HOST THAT WAS VALIDATED.
+#
+# `messages_endpoint()` checks the scheme and host of the URL you CONFIGURED.
+# Nothing checked where that URL sends you next, and urllib's default redirect
+# handler strips only `content-length` and `content-type` -- every other header
+# is copied onto the new request, including `x-api-key`. So a validated https
+# endpoint answering 302 hands the API key to whatever host it names.
+#
+# MEASURED ON 2026-08-31, three ways rather than argued:
+#   HTTPRedirectHandler.redirect_request(..., "https://evil.example/collect")
+#     returned a Request for evil.example carrying {'X-api-key': '<sentinel>'}
+#   end to end over two loopback servers, the redirect TARGET received the
+#     sentinel value verbatim
+#   with this opener, the same call raises HTTPError 302 and the target
+#     receives nothing
+#
+# Returning None from redirect_request makes urllib raise rather than follow,
+# which lands in the `except urllib.error.HTTPError` below and becomes
+# STATUS_FAILED -- blocking, and visible in the posted comment. A redirect the
+# operator actually wants is then a deliberate configuration change rather than
+# a silent key egress, which is the right way round.
+#
+# This is the residual half of the threat `messages_endpoint()` was written for:
+# it validated the destination and not the journey.
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+# build_opener replaces a default handler when the class given subclasses it,
+# so this opener is the default stack with redirects refused and nothing else
+# changed -- proxies, cookies and TLS verification all behave as before.
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def is_upstream_credit_exhausted(detail: str | None) -> bool:
+    """Did the PROVIDER refuse for lack of credit, behind the broker's status?
+
+    Read on the BODY rather than the status code, because the code is the
+    broker's and the reason is the provider's. LiteLLM forwards an Anthropic
+    refusal as HTTP 400 -- not 402, not 429 -- with the provider's own JSON
+    embedded as an escaped string inside its own. Nothing about the status
+    distinguishes it from a malformed request.
+
+    Measured 2026-09-01, when it stopped every review and every agent
+    constraint across the repo and the posted comment said only "HTTP 400 from
+    the API".
+
+    Deliberately narrow: `credit balance` and `insufficient credit` are the
+    provider's phrasings for an empty account. `budget` is NOT matched here --
+    that is the per-key ceiling the branch above already owns, and folding the
+    two together would tell the operator to top up an account when the actual
+    fix is to raise a cap.
+    """
+    lowered = (detail or "").lower()
+    return "credit balance" in lowered or "insufficient credit" in lowered
+
+
 def call_claude(review_text: str, review_scope: str = "diff") -> str:
     key = os.getenv("ANTHROPIC_API_KEY")
     if not key:
-        return "## Claude Code Review\n\nSkipped: `ANTHROPIC_API_KEY` is not configured."
+        # Built from NO_KEY_BANNER rather than repeating the string, so the
+        # producer and the classifier cannot drift apart -- the whole defect was
+        # a body no classifier case matched.
+        return f"## Claude Code Review\n\n{NO_KEY_BANNER}"
 
     project = (os.getenv("REVIEW_PROJECT_NAME") or "this repository").strip()
     common = (
@@ -1256,21 +1549,126 @@ def call_claude(review_text: str, review_scope: str = "diff") -> str:
         # longer than the timeout allowed, so the job started dying on
         # TimeoutError instead of posting. The read has to outlast the
         # generation it asked for.
-        with urllib.request.urlopen(request, timeout=300) as response:
-            body = json.loads(response.read().decode("utf-8"))
+        with _NO_REDIRECT_OPENER.open(request, timeout=300) as response:
+            raw = response.read()
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:1000]
         hint = ""
-        if exc.code in (401, 403):
+        # THE STATUS-AUTHORITATIVE BRANCH GOES FIRST, because two branches
+        # below classify on the BODY and a body can say anything. A 3xx is a
+        # redirect by definition -- the broker never reached the provider, so
+        # no provider verdict can be in that body -- yet `"budget" in detail`
+        # and `is_upstream_credit_exhausted(detail)` would both happily claim
+        # one that merely contained the words, and the operator would be told
+        # to top up an account over what is a base-URL mistake. Raised in
+        # review on #204 against the credit branch alone; the `budget` branch
+        # has the same hole, and ordering closes both rather than bolting a
+        # code guard onto each.
+        if 300 <= exc.code < 400:
+            hint = (
+                " The endpoint answered with a redirect, which is REFUSED rather"
+                " than followed: urllib copies every header but content-length"
+                " and content-type onto the new request, so following it would"
+                " hand the API key to whatever host the redirect names. The key"
+                " was NOT sent onward. Point ANTHROPIC_BASE_URL at the final"
+                " host instead."
+            )
+        elif exc.code in (401, 403):
             hint = " The key is not accepted at this endpoint."
         elif exc.code == 402 or "budget" in detail.lower():
             hint = " This reads as a spending ceiling on the key rather than a transient error."
         elif exc.code == 429:
             hint = " Rate limited, or a spending ceiling; the body below says which."
+        elif is_upstream_credit_exhausted(detail):
+            # UPSTREAM CREDIT IS NOT THE KEY, THE CAP, OR A 429, and until
+            # 2026-09-01 nothing here said so. The broker forwards the
+            # provider's refusal as HTTP 400 with the reason nested two JSON
+            # levels down -- `{"error":{"message":"{\"error\":{\"message\":
+            # \"Your credit balance is too low...\"}}"}}` -- so the operator
+            # saw "HTTP 400 from the API" and a wall of escaped JSON, while the
+            # hint list offered "401 or 403 is the key, 402 is the budget",
+            # none of which matched. Diagnosing it meant reading the nested
+            # string by hand.
+            #
+            # Three different money failures now reach this branch table and
+            # each needs its own sentence: a team DAILY CAP (429,
+            # budget_exceeded), a per-key ceiling (402), and the provider
+            # account being empty (400, here). They are fixed in different
+            # places by different people, which is the whole reason the message
+            # has to distinguish them.
+            hint = (
+                " The BROKER reached the provider and the provider refused for"
+                " lack of credit -- this is the upstream account being empty,"
+                " not the key, not a per-key ceiling, and not a rate limit."
+                " No re-run will clear it and no ceiling can be raised past it."
+                " Add credit to the provider account."
+            )
         return (
             f"## Claude Code Review\n\n{FAILED_BANNER} HTTP {exc.code} from the API,"
             f" so nothing in this diff was reviewed.{hint}"
             f"\n\n```text\n{detail}\n```"
+        )
+    except OSError as exc:
+        # A NETWORK FAILURE THAT IS NOT AN HTTP ERROR STILL HAS TO POST.
+        #
+        # Only HTTPError was caught, so a read timeout, a DNS failure, a reset
+        # connection or a TLS error propagated out of main() and killed the
+        # process before write_status() ran. The workflow caught THAT correctly
+        # -- "No Claude review status was written, so nothing proves a review
+        # ran", red rather than green -- but the promise this branch makes,
+        # that the posted comment carries the reason, was not kept: there was
+        # no comment at all, and the reason lived in a stack trace in the job
+        # log. Measured on kit #192 on 2026-08-31: `TimeoutError: The read
+        # operation timed out` after 5m17s, no comment, no status file.
+        #
+        # THE COMMENT ABOVE THIS ONE ALREADY DESCRIBES THIS FAILURE HAPPENING
+        # ONCE BEFORE, and the fix chosen then was to raise the timeout from 60s
+        # to 300s. That treated the symptom -- the review got slower, so the
+        # ceiling moved -- and left the class: any network exception still took
+        # the status file with it. It fired again at 300s. A timeout is not a
+        # thing a ceiling can be raised past, only made rarer.
+        #
+        # OSError is the right net rather than a list of names: TimeoutError,
+        # socket.timeout, ConnectionResetError and urllib's URLError are all
+        # subclasses of it, and a new one will be too. HTTPError is a subclass
+        # of URLError and therefore of OSError, so the handler above MUST stay
+        # first -- it is more specific and carries the status code this one
+        # cannot.
+        return (
+            f"## Claude Code Review\n\n{FAILED_BANNER} The API call did not"
+            f" complete ({type(exc).__name__}), so nothing in this diff was"
+            f" reviewed. This is a transport failure rather than a rejection:"
+            f" there is no status code because no response arrived. A re-run is"
+            f" the first thing to try.\n\n```text\n{exc}\n```"
+        )
+
+    # A BODY THAT ARRIVED BUT DOES NOT PARSE IS THE SAME BUG, ONE INPUT OVER.
+    #
+    # The handlers above catch the call failing. They do not catch the ANSWER
+    # being unreadable: `json.loads` raises JSONDecodeError and `.decode` raises
+    # UnicodeDecodeError, both ValueError and neither an OSError, so a proxy
+    # error page, a truncated response or a gateway's HTML would propagate out
+    # of main() and take `write_status()` with it -- the identical
+    # crash-before-status-write this commit's parent fixed for transport.
+    #
+    # Raised in review on #197, on the commit that fixed the transport half. It
+    # is the same defect wearing a different exception type, which is the fourth
+    # time this file has met "fixed the shape, missed its neighbour" in a week.
+    #
+    # The read moved out of the try above so the raw bytes survive to be shown:
+    # "the endpoint returned something unparseable" is not actionable, and the
+    # first 1000 characters of it usually are -- a Cloudflare page and a
+    # truncated JSON body look nothing alike.
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except ValueError as exc:
+        detail = raw.decode("utf-8", errors="replace")[:1000]
+        return (
+            f"## Claude Code Review\n\n{FAILED_BANNER} The endpoint answered,"
+            f" but the body did not parse as JSON ({type(exc).__name__}), so"
+            f" nothing in this diff was reviewed. A proxy error page or a"
+            f" truncated response reads like this; the first 1000 characters"
+            f" are below.\n\n```text\n{detail}\n```"
         )
 
     text = review_text_from_body(body)
