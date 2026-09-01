@@ -12,6 +12,7 @@ to give the reviewer the repo name; everything else has safe defaults.
 """
 
 import fnmatch
+import http.client
 import json
 import os
 import re
@@ -232,11 +233,19 @@ _PATTERN_OR_PLACEHOLDER = (
 # (2) Only method calls and subscripts may follow, and the chain must END the
 #     value. `token = token.strip() or "hunter2"` has a literal after the chain,
 #     so it is not exempt and the literal still goes.
-# (3) NO ARGUMENT MAY CARRY A LONG ALPHANUMERIC RUN. `.strip("'\"")` and
-#     `.split(",")` are punctuation and stay exempt; `.replace("hunter2abc", "")`
+# (3) NO ARGUMENT OR SUBSCRIPT MAY CARRY A LONG ALPHANUMERIC RUN. `.strip("'\"")`
+#     and `.split(",")` are punctuation and stay exempt; `.replace("hunter2abc", "")`
 #     is a literal in an argument and is redacted. Eight characters is the bar,
 #     the same order as the vendor entries below, and deliberately low: an
 #     argument that long is doing something other than trimming.
+#
+#     The bracket branch did not have this guard for a while. Rule (3) was
+#     written about arguments, the regex applied it to calls, and
+#     `token = token["AbCdEfGh12345678"]` went through as a reshape with the
+#     literal still on the line. Raised by the reviewer on
+#     gestalt-workframe-edu#609 and measured before fixing: three of seven
+#     shapes leaked, and the call branch beside them refused its control case.
+#     Same lookahead, both branches, kit #212.
 #
 # `db_password = db_password.strip()` is NOT exempt, because the key group
 # matches the tail (`password`) and the backreference then looks for `password`
@@ -244,7 +253,8 @@ _PATTERN_OR_PLACEHOLDER = (
 # direction, and narrowing it further would mean matching the whole name.
 _SELF_RESHAPE = (
     r"(?P=key)"
-    r"(?:\.\w+(?:\((?![^()\n]*[A-Za-z0-9]{8})[^()\n]*\))?|\[[^\[\]\n]*\])+"
+    r"(?:\.\w+(?:\((?![^()\n]*[A-Za-z0-9]{8})[^()\n]*\))?"
+    r"|\[(?![^\[\]\n]*[A-Za-z0-9]{8})[^\[\]\n]*\])+"
 )
 
 # What the value rule refuses to treat as a value. One name so the branch that
@@ -1607,6 +1617,36 @@ def call_claude(review_text: str, review_scope: str = "diff") -> str:
             f"## Claude Code Review\n\n{FAILED_BANNER} HTTP {exc.code} from the API,"
             f" so nothing in this diff was reviewed.{hint}"
             f"\n\n```text\n{detail}\n```"
+        )
+    except http.client.HTTPException as exc:
+        # A RESPONSE THAT ARRIVED AND THEN STOPPED IS NOT AN OSError.
+        #
+        # The branch below is for the transport failing before any response:
+        # timeout, reset, DNS, TLS. This one is the response failing AFTER it
+        # began -- a status line and a Content-Length came back, then the
+        # connection closed with bytes still owed, and http.client raised
+        # IncompleteRead out of response.read(). HTTPException derives from
+        # Exception, not OSError, so the net below never saw it and the process
+        # died before write_status() ran: the exact crash-before-status shape
+        # that branch was added to close, arriving through a class it did not
+        # name. Raised by the reviewer on claude-cert-examprep#9, reproduced on
+        # a loopback socket, kit #211.
+        #
+        # Its own sentence, because the OSError one would be false here. A
+        # response DID arrive, with a status code. Say what was cut short.
+        size = ""
+        if isinstance(exc, http.client.IncompleteRead):
+            got = len(exc.partial)
+            if exc.expected is not None:
+                size = f" {got} bytes arrived of {got + exc.expected} promised."
+            else:
+                size = f" {got} bytes arrived before the connection closed."
+        return (
+            f"## Claude Code Review\n\n{FAILED_BANNER} The endpoint answered and"
+            f" the body was cut off before it finished ({type(exc).__name__}),"
+            f" so nothing in this diff was reviewed.{size} A proxy or the broker"
+            f" closed the connection mid-response; that is transient more often"
+            f" than not, and a re-run is the first thing to try.\n\n```text\n{exc}\n```"
         )
     except OSError as exc:
         # A NETWORK FAILURE THAT IS NOT AN HTTP ERROR STILL HAS TO POST.
