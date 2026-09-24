@@ -24,6 +24,7 @@ import itertools
 import json
 import os
 import re
+import tempfile
 import threading
 import time
 import unittest
@@ -1805,6 +1806,98 @@ class ATruncatedBodyStillPostsAReason(unittest.TestCase):
         self.assertFalse(issubclass(http.client.HTTPException, OSError))
 
 
+class AFailureBeforeAnyBodyIsNotACutOffBody(unittest.TestCase):
+    """#213 added `except http.client.HTTPException` with one sentence: the
+    endpoint answered and the body was cut off. Measured on kit #217, that is
+    true for exactly one of thirteen subclasses. A garbage status line raises
+    BadStatusLine -- nothing answered -- and was told it had. The fix keeps the
+    broad net (every one of the thirteen would otherwise crash the reviewer
+    before write_status(), which is what #213 closed) and chooses the sentence
+    by type.
+
+    The real-socket case is BadStatusLine, because http.client raising it from
+    a real read is the thing a mock cannot testify to. RemoteDisconnected is
+    tested by type through a mocked opener: which exception a closed socket
+    surfaces as is platform-bound (RST on Windows is ConnectionResetError, a
+    clean FIN on Linux is RemoteDisconnected), and the claim under test is the
+    wording for the type, not the socket.
+    """
+
+    def _serve_garbage(self):
+        import socketserver
+
+        class Garbage(socketserver.BaseRequestHandler):
+            def handle(inner):
+                inner.request.recv(65536)
+                inner.request.sendall(b"<html>502 Bad Gateway</html>\r\n\r\n")
+                inner.request.close()
+
+        server = socketserver.TCPServer(("127.0.0.1", 0), Garbage)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        return server.server_address[1]
+
+    def _call(self):
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "k"}, clear=False):
+            return claude_review.call_claude("diff")
+
+    def test_a_garbage_status_line_is_not_an_answer(self):
+        port = self._serve_garbage()
+        with mock.patch.object(
+            claude_review, "messages_endpoint",
+            return_value=f"http://127.0.0.1:{port}/v1/messages",
+        ):
+            body = self._call()
+        self.assertIn(claude_review.FAILED_BANNER, body)
+        self.assertEqual(claude_review.STATUS_FAILED, claude_review.status_for(body))
+        self.assertIn("BadStatusLine", body)
+        self.assertNotIn("answered", body.lower())
+        self.assertNotIn("cut off", body.lower())
+
+    def test_a_peer_that_hung_up_did_not_answer(self):
+        exc = http.client.RemoteDisconnected("Remote end closed connection without response")
+        with mock.patch.object(claude_review._NO_REDIRECT_OPENER, "open", side_effect=exc):
+            body = self._call()
+        self.assertIn(claude_review.FAILED_BANNER, body)
+        self.assertIn("RemoteDisconnected", body)
+        self.assertIn("without sending a response", body)
+        self.assertNotIn("answered", body.lower())
+        self.assertNotIn("cut off", body.lower())
+
+    def test_a_cut_off_body_still_says_so_with_its_counts(self):
+        exc = http.client.IncompleteRead(b"x" * 20, 4076)
+        with mock.patch.object(claude_review._NO_REDIRECT_OPENER, "open", side_effect=exc):
+            body = self._call()
+        self.assertIn("cut off", body.lower())
+        self.assertIn("20 bytes arrived of 4096 promised", body)
+
+    def test_no_other_subclass_claims_a_body(self):
+        seen = 0
+        for name in sorted(dir(http.client)):
+            cls = getattr(http.client, name)
+            if not (isinstance(cls, type) and issubclass(cls, http.client.HTTPException)):
+                continue
+            if cls in (http.client.HTTPException, http.client.IncompleteRead,
+                       http.client.RemoteDisconnected):
+                continue
+            try:
+                exc = cls("x")
+            except TypeError:
+                continue
+            seen += 1
+            with self.subTest(exception=name):
+                with mock.patch.object(
+                    claude_review._NO_REDIRECT_OPENER, "open", side_effect=exc
+                ):
+                    body = self._call()
+                self.assertIn(claude_review.FAILED_BANNER, body)
+                self.assertIn(name, body)
+                self.assertNotIn("answered", body.lower())
+                self.assertNotIn("cut off", body.lower())
+        self.assertGreater(seen, 5, "the table found almost nothing to test, which is not a pass")
+
+
 class AVendorKeyIsRecognisedWithoutParsingTheLine(unittest.TestCase):
     """The half of the table that does not care where the value sits.
 
@@ -3522,6 +3615,136 @@ class AnAppendIsAnAssignment(unittest.TestCase):
         for line in ("password -= 1", "token *= 2"):
             with self.subTest(line=line):
                 self.assertEqual(line, claude_review.redact(line))
+
+
+class ACutDiffSaysWhatItLeftOut(unittest.TestCase):
+    """Measured on EGI_bot#117 (2026-09-24), a ~5,000-line kit sync.
+
+    `redact(diff)[:MAX_REVIEW_CHARS]` cut the diff mid-line with no marker. The
+    review called the cut "truncated mid-string" and asked whether it was a
+    syntax error, never mentioned the files after it, and the status was `ok`.
+    MAX_REVIEW_CHARS is patched small here so the fixtures stay readable.
+    """
+
+    CAP = 1000
+
+    def setUp(self):
+        patcher = mock.patch.object(claude_review, "MAX_REVIEW_CHARS", self.CAP)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _file(name, lines):
+        return f"diff --git a/{name} b/{name}\n" + "".join(
+            f"+line {i} of {name}\n" for i in range(lines)
+        )
+
+    def _diff(self, *files):
+        return "\n".join(self._file(name, lines) for name, lines in files)
+
+    def test_a_diff_inside_the_budget_is_untouched(self):
+        diff = self._diff(("a.py", 5))
+        self.assertEqual(claude_review.cap_diff(diff), (diff, ""))
+
+    def test_every_file_after_the_cut_is_named(self):
+        diff = self._diff(("a.py", 10), ("b.py", 10), ("c.py", 60), ("d.py", 5))
+        text, note = claude_review.cap_diff(diff)
+        self.assertIn("Cut partway: `c.py`.", note)
+        self.assertIn("Not reviewed at all: `d.py`.", note)
+        # Files that fit whole are not listed as missing.
+        self.assertNotIn("a.py", note)
+        self.assertNotIn("b.py", note)
+
+    def test_the_cut_lands_on_a_line_boundary(self):
+        diff = self._diff(("a.py", 200))
+        text, _ = claude_review.cap_diff(diff)
+        kept = text.split("\n--- DIFF CUT HERE", 1)[0]
+        self.assertTrue(diff.startswith(kept))
+        self.assertLessEqual(len(kept), self.CAP)
+        self.assertTrue(kept.endswith("\n"), "the last line reached the model half-written")
+
+    def test_the_model_is_told_the_cut_is_not_the_authors(self):
+        text, note = claude_review.cap_diff(self._diff(("a.py", 200)))
+        self.assertIn("NOT BY THE AUTHOR", text)
+        self.assertIn(note, text)
+
+    def test_one_line_longer_than_the_budget_still_gets_cut(self):
+        text, note = claude_review.cap_diff("x" * (self.CAP * 2))
+        self.assertTrue(text.startswith("x" * self.CAP + "\n--- DIFF CUT HERE"))
+        self.assertIn(f"{self.CAP:,} of {self.CAP * 2:,} characters", note)
+
+    def test_a_long_list_of_missing_files_is_capped(self):
+        files = [("big.py", 100)] + [(f"f{i}.py", 1) for i in range(100)]
+        _, note = claude_review.cap_diff(self._diff(*files))
+        self.assertIn("and 60 more", note)
+
+    def _main(self, api_content):
+        """Run main() over a diff twice the cap, with the API answering api_content."""
+        payload = json.dumps({
+            "content": api_content,
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 20},
+        }).encode()
+
+        class Response:
+            def read(self):
+                return payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        diff = self._diff(("a.py", 10), ("b.py", 60), ("c.py", 5))
+        env = {
+            "ANTHROPIC_API_KEY": "test-key",
+            "REVIEW_SCOPE": "diff",
+            "BASE_SHA": "base",
+            "HEAD_SHA": "head",
+        }
+        cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, env, clear=False
+        ), mock.patch.object(claude_review, "pr_diff", return_value=diff), mock.patch.object(
+            claude_review._NO_REDIRECT_OPENER, "open", return_value=Response()
+        ):
+            os.environ.pop("ANTHROPIC_BASE_URL", None)
+            os.chdir(tmp)
+            try:
+                self.assertEqual(claude_review.main(), 0)
+                status = Path(claude_review.REVIEW_STATUS_PATH).read_text(encoding="utf-8")
+                comment = Path("claude-review.md").read_text(encoding="utf-8")
+            finally:
+                os.chdir(cwd)
+        return status.strip(), comment
+
+    def test_a_finished_review_of_a_cut_diff_is_partial_not_ok(self):
+        status, comment = self._main([{"type": "text", "text": "Line 3 does two things."}])
+        self.assertEqual(status, claude_review.STATUS_PARTIAL)
+        self.assertTrue(
+            comment.startswith("## Claude Code Review\n\n" + claude_review.PARTIAL_BANNER)
+        )
+        self.assertIn("Not reviewed at all: `c.py`.", comment)
+        self.assertIn("Line 3 does two things.", comment)
+
+    def test_an_empty_review_of_a_cut_diff_stays_empty(self):
+        # The partial banner must not land in front of a worse status and hide it.
+        status, comment = self._main([{"type": "thinking", "thinking": ""}])
+        self.assertEqual(status, claude_review.STATUS_EMPTY)
+        self.assertNotIn(claude_review.PARTIAL_BANNER, comment)
+
+    def test_the_gate_warns_on_partial_and_does_not_block(self):
+        workflow = TheCheckoutFollowsTheBaseBranch._workflow()
+        self.assertIsNotNone(workflow, "claude-review.yml not found beside this test")
+        case = workflow.split('case "$status" in', 1)[1].split("esac", 1)[0]
+        self.assertIn("partial)", case, "the workflow has no branch for a partial review")
+        branch = case.split("partial)", 1)[1].split(";;", 1)[0]
+        self.assertIn("::warning::", branch)
+        self.assertNotIn("exit 1", branch)
+        # And it is not swept in silently with the green ones.
+        self.assertNotIn("partial", case.split(")", 1)[0])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

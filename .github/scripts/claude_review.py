@@ -1109,12 +1109,55 @@ def pr_diff() -> str:
     return "\n".join(patches)
 
 
-def diff_text(base: str, head: str) -> str:
+_FILE_HEADER = re.compile(r"^diff --git a/.* b/(.*)$", re.M)
+
+
+def _name_list(paths: list[str], limit: int = 40) -> str:
+    names = ", ".join(f"`{path}`" for path in paths[:limit])
+    more = len(paths) - limit
+    return names + (f", and {more} more" if more > 0 else "")
+
+
+def cap_diff(diff: str) -> tuple[str, str]:
+    """Fit a diff into MAX_REVIEW_CHARS and say what did not fit.
+
+    Returns the text the model reads and a note for the reader, empty when
+    nothing was cut. The cut lands on a line boundary, so no line reaches the
+    model half-written, and the marker goes INSIDE the text the model reads:
+    without it the tail of a cut file looks like the author's broken code.
+    """
+    if len(diff) <= MAX_REVIEW_CHARS:
+        return diff, ""
+    # rfind is -1 when the first MAX_REVIEW_CHARS hold no newline at all; then
+    # the only cut left is the character count.
+    kept = diff.rfind("\n", 0, MAX_REVIEW_CHARS) + 1 or MAX_REVIEW_CHARS
+    headers = list(_FILE_HEADER.finditer(diff))
+    ends = [header.start() for header in headers[1:]] + [len(diff)]
+    cut_partway = [
+        h.group(1).strip() for h, end in zip(headers, ends) if h.start() < kept < end
+    ]
+    unreviewed = [h.group(1).strip() for h in headers if h.start() >= kept]
+    parts = [f"{kept:,} of {len(diff):,} characters of this diff were reviewed."]
+    if cut_partway:
+        parts.append(f"Cut partway: {_name_list(cut_partway)}.")
+    if unreviewed:
+        parts.append(f"Not reviewed at all: {_name_list(unreviewed)}.")
+    note = " ".join(parts)
+    marker = f"\n--- DIFF CUT HERE BY THE REVIEW TOOL, NOT BY THE AUTHOR. {note} ---\n"
+    return diff[:kept] + marker, note
+
+
+def review_diff(base: str, head: str) -> tuple[str, str]:
+    """The redacted diff to review, capped, and the note naming what the cap left out."""
     diff = pr_diff()
     if not diff:
         pathspecs = [*ALLOW_PATTERNS, *[f":!{pattern}" for pattern in EXCLUDE_PATTERNS]]
         diff = run_git(["diff", "--unified=80", base, head, "--", *pathspecs])
-    return redact(diff)[:MAX_REVIEW_CHARS]
+    return cap_diff(redact(diff))
+
+
+def diff_text(base: str, head: str) -> str:
+    return review_diff(base, head)[0]
 
 
 def codebase_snapshot() -> str:
@@ -1178,6 +1221,19 @@ TRUNCATED_BANNER = (
 # answered {"type":"budget_exceeded"} with 429, the posted comment said exactly
 # that in plain text, and the job passed in 14 seconds.
 FAILED_BANNER = "**The review did not run.**"
+# THE DIFF THE MODEL SAW WAS NOT ALWAYS THE DIFF. `[:MAX_REVIEW_CHARS]` cut every
+# larger diff at a character count, mid-file and mid-line, and said nothing: the
+# review reported on the head as though it were the whole change, and the status
+# was `ok`. Measured on EGI_bot#117 (2026-09-24), a ~5,000-line kit sync: the
+# review called the cut "truncated mid-string" and asked whether it was a syntax
+# error, and never mentioned the files after it.
+#
+# A cut review is named, not failed. The reader is told which files were not
+# read, so the unreviewed part is KNOWN -- the line the truncated-answer case
+# draws -- and a large PR cannot get under the cap except by splitting, so red
+# here would block every kit sync. The gate passes it with a warning.
+STATUS_PARTIAL = "partial"
+PARTIAL_BANNER = "> **Partial: this diff was larger than the review budget.**"
 
 
 def write_status(status: str) -> None:
@@ -1207,6 +1263,8 @@ def review_status(text: str) -> str:
     # is what may excuse it.
     if text.startswith(NO_KEY_BANNER):
         return STATUS_NO_KEY
+    if text.startswith(PARTIAL_BANNER):
+        return STATUS_PARTIAL
     return STATUS_OK
 
 
@@ -1634,20 +1692,44 @@ def call_claude(review_text: str, review_scope: str = "diff") -> str:
         #
         # Its own sentence, because the OSError one would be false here. A
         # response DID arrive, with a status code. Say what was cut short.
-        size = ""
+        # THE SENTENCE IS CHOSEN BY TYPE, because the first version said
+        # "the endpoint answered and the body was cut off" for every subclass,
+        # and measured on kit #217 that is true for one of thirteen. A garbage
+        # status line raises BadStatusLine -- nothing answered -- and was told
+        # it had. RemoteDisconnected is a peer that hung up before saying
+        # anything. The net stays broad so none of them crash the reviewer;
+        # only the words narrow.
+        kind = type(exc).__name__
         if isinstance(exc, http.client.IncompleteRead):
             got = len(exc.partial)
             if exc.expected is not None:
                 size = f" {got} bytes arrived of {got + exc.expected} promised."
             else:
                 size = f" {got} bytes arrived before the connection closed."
-        return (
-            f"## Claude Code Review\n\n{FAILED_BANNER} The endpoint answered and"
-            f" the body was cut off before it finished ({type(exc).__name__}),"
-            f" so nothing in this diff was reviewed.{size} A proxy or the broker"
-            f" closed the connection mid-response; that is transient more often"
-            f" than not, and a re-run is the first thing to try.\n\n```text\n{exc}\n```"
-        )
+            what = (
+                f" The endpoint answered and the body was cut off before it"
+                f" finished ({kind}), so nothing in this diff was reviewed.{size}"
+                f" A proxy or the broker closed the connection mid-response;"
+                f" that is transient more often than not, and a re-run is the"
+                f" first thing to try."
+            )
+        elif isinstance(exc, http.client.RemoteDisconnected):
+            what = (
+                f" The server closed the connection without sending a response"
+                f" ({kind}), so nothing in this diff was reviewed. That is what"
+                f" a broker restarting mid-request looks like; a re-run is the"
+                f" first thing to try."
+            )
+        else:
+            what = (
+                f" The HTTP exchange failed before a response was complete"
+                f" ({kind}), so nothing in this diff was reviewed. What came"
+                f" back was not an HTTP response the client could read -- a"
+                f" proxy error page on a raw socket reads like this. A re-run"
+                f" is the first thing to try; if it repeats, the detail below"
+                f" is the thing to look at."
+            )
+        return f"## Claude Code Review\n\n{FAILED_BANNER}{what}\n\n```text\n{exc}\n```"
     except OSError as exc:
         # A NETWORK FAILURE THAT IS NOT AN HTTP ERROR STILL HAS TO POST.
         #
@@ -1720,19 +1802,34 @@ def call_claude(review_text: str, review_scope: str = "diff") -> str:
     return "\n\n".join(parts)
 
 
+def mark_partial(body: str, note: str) -> str:
+    """Put the cut at the top of a finished review, where it is read first."""
+    banner = f"{PARTIAL_BANNER} {note} Review the rest directly, or split the PR.\n\n"
+    head, header, rest = body.partition("## Claude Code Review\n\n")
+    if not header:
+        return banner + body
+    return head + header + banner + rest
+
+
 def main() -> int:
     review_scope = os.getenv("REVIEW_SCOPE", "diff").strip().lower()
+    cut_note = ""
     if review_scope == "full":
         review_text = codebase_snapshot()
     else:
         base, head = base_head()
-        review_text = diff_text(base, head)
+        review_text, cut_note = review_diff(base, head)
     if not review_text.strip():
         write_review("## Claude Code Review\n\nSkipped: no reviewable diff.")
         write_status(STATUS_SKIPPED)
         return 0
 
     body = call_claude(review_text, review_scope=review_scope)
+    # Only a FINISHED review is marked partial. A failed, empty or truncated one
+    # is already red, and a banner in front of it would hide that from
+    # status_for, which reads the opening line.
+    if cut_note and status_for(body) == STATUS_OK:
+        body = mark_partial(body, cut_note)
     write_review(body)
     # The status is read from the REVIEW TEXT, which is the part
     # review_text_from_body already classified, not from the wrapper.

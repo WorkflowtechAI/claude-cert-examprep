@@ -246,6 +246,15 @@ jobs:
                 exit 1
               fi
               ;;
+            partial)
+              # The diff was bigger than the review budget. Unlike `truncated`,
+              # the gap is KNOWN: the comment names every file the model did not
+              # read. A large PR cannot get under the cap except by splitting, so
+              # this warns rather than blocks -- but it is never reported as ok.
+              echo "::warning::The Claude review covered only part of this diff: it was" \
+                   "larger than the review budget. The PR comment names the files it did" \
+                   "not read; review those directly."
+              ;;
             truncated)
               echo "::error::The Claude review hit its output-token ceiling and is incomplete," \
                    "so an unknown part of this diff went unreviewed. Raise CLAUDE_REVIEW_MAX_TOKENS" \
