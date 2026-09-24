@@ -3632,6 +3632,12 @@ class ACutDiffSaysWhatItLeftOut(unittest.TestCase):
         patcher = mock.patch.object(claude_review, "MAX_REVIEW_CHARS", self.CAP)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The review job runs this suite with the repo's CLAUDE_REVIEW_MAX_CHARS
+        # in its environment, and a set value would override the patched cap.
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_REVIEW_MAX_CHARS"}
+        env_patcher = mock.patch.dict(os.environ, env, clear=True)
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
 
     @staticmethod
     def _file(name, lines):
@@ -3678,8 +3684,8 @@ class ACutDiffSaysWhatItLeftOut(unittest.TestCase):
         _, note = claude_review.cap_diff(self._diff(*files))
         self.assertIn("and 60 more", note)
 
-    def _main(self, api_content):
-        """Run main() over a diff twice the cap, with the API answering api_content."""
+    def _main(self, api_content, diff=None):
+        """Run main() over a diff past the cap, with the API answering api_content."""
         payload = json.dumps({
             "content": api_content,
             "stop_reason": "end_turn",
@@ -3696,7 +3702,8 @@ class ACutDiffSaysWhatItLeftOut(unittest.TestCase):
             def __exit__(self, *exc):
                 return False
 
-        diff = self._diff(("a.py", 10), ("b.py", 60), ("c.py", 5))
+        if diff is None:
+            diff = self._diff(("a.py", 10), ("b.py", 60), ("c.py", 5))
         env = {
             "ANTHROPIC_API_KEY": "test-key",
             "REVIEW_SCOPE": "diff",
@@ -3734,16 +3741,72 @@ class ACutDiffSaysWhatItLeftOut(unittest.TestCase):
         self.assertEqual(status, claude_review.STATUS_EMPTY)
         self.assertNotIn(claude_review.PARTIAL_BANNER, comment)
 
-    def test_the_gate_warns_on_partial_and_does_not_block(self):
+    def test_the_gate_fails_the_check_on_partial(self):
+        # It warned at first (kit #284). capaz#14's review showed why that was
+        # wrong: see the padding test below.
         workflow = TheCheckoutFollowsTheBaseBranch._workflow()
         self.assertIsNotNone(workflow, "claude-review.yml not found beside this test")
         case = workflow.split('case "$status" in', 1)[1].split("esac", 1)[0]
         self.assertIn("partial)", case, "the workflow has no branch for a partial review")
         branch = case.split("partial)", 1)[1].split(";;", 1)[0]
-        self.assertIn("::warning::", branch)
-        self.assertNotIn("exit 1", branch)
-        # And it is not swept in silently with the green ones.
+        self.assertIn("::error::", branch)
+        self.assertIn("exit 1", branch)
         self.assertNotIn("partial", case.split(")", 1)[0])
+        # The raw variable may be a typo the script fell back from; the budget
+        # actually used is in the PR comment, so the gate must not echo it.
+        self.assertNotIn("${CLAUDE_REVIEW_MAX_CHARS", branch)
+
+    def test_padding_the_head_cannot_carry_a_change_past_the_review(self):
+        """The attack the warning allowed: the author orders the diff.
+
+        Filler first, the change that matters after the cut. The model never
+        sees it, so the only thing standing between it and a passing check is
+        this status -- which the gate now fails.
+        """
+        diff = self._diff(("aaa_filler.py", 200), ("zzz_payload.py", 3))
+        status, comment = self._main(
+            [{"type": "text", "text": "Nothing to flag."}], diff=diff
+        )
+        self.assertEqual(status, claude_review.STATUS_PARTIAL)
+        self.assertIn("Not reviewed at all: `zzz_payload.py`.", comment)
+        self.assertIn("CLAUDE_REVIEW_MAX_CHARS", comment)
+
+
+class TheBudgetComesFromTheEnvironment(unittest.TestCase):
+    """CLAUDE_REVIEW_MAX_CHARS, parsed exactly like CLAUDE_REVIEW_MAX_TOKENS.
+
+    A partial review fails the check, so a repo whose PRs are routinely large
+    needs a way to raise the budget that is not an edit to a vendored file.
+    """
+
+    @staticmethod
+    def _budget(value):
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"CLAUDE_REVIEW_MAX_CHARS": value}):
+            with contextlib.redirect_stderr(err):
+                got = claude_review.review_budget()
+        return got, err.getvalue()
+
+    def test_empty_string_means_the_default(self):
+        self.assertEqual(self._budget("")[0], claude_review.MAX_REVIEW_CHARS)
+
+    def test_a_repo_value_wins_and_the_cut_uses_it(self):
+        self.assertEqual(self._budget(" 400000 ")[0], 400000)
+        diff = "x\n" * 100
+        with mock.patch.dict(os.environ, {"CLAUDE_REVIEW_MAX_CHARS": "50"}):
+            text, note = claude_review.cap_diff(diff)
+        self.assertIn("50 of 200 characters", note)
+
+    def test_a_typo_falls_back_out_loud(self):
+        got, err = self._budget("lots")
+        self.assertEqual(got, claude_review.MAX_REVIEW_CHARS)
+        self.assertIn("CLAUDE_REVIEW_MAX_CHARS='lots'", err)
+
+    def test_the_workflow_passes_the_repository_variable(self):
+        workflow = TheCheckoutFollowsTheBaseBranch._workflow()
+        self.assertIn(
+            "CLAUDE_REVIEW_MAX_CHARS: ${{ vars.CLAUDE_REVIEW_MAX_CHARS }}", workflow
+        )
 
 
 if __name__ == "__main__":
