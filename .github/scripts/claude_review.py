@@ -1119,18 +1119,19 @@ def _name_list(paths: list[str], limit: int = 40) -> str:
 
 
 def cap_diff(diff: str) -> tuple[str, str]:
-    """Fit a diff into MAX_REVIEW_CHARS and say what did not fit.
+    """Fit a diff into the review budget and say what did not fit.
 
     Returns the text the model reads and a note for the reader, empty when
     nothing was cut. The cut lands on a line boundary, so no line reaches the
     model half-written, and the marker goes INSIDE the text the model reads:
     without it the tail of a cut file looks like the author's broken code.
     """
-    if len(diff) <= MAX_REVIEW_CHARS:
+    budget = review_budget()
+    if len(diff) <= budget:
         return diff, ""
-    # rfind is -1 when the first MAX_REVIEW_CHARS hold no newline at all; then
-    # the only cut left is the character count.
-    kept = diff.rfind("\n", 0, MAX_REVIEW_CHARS) + 1 or MAX_REVIEW_CHARS
+    # rfind is -1 when the first `budget` characters hold no newline at all;
+    # then the only cut left is the character count.
+    kept = diff.rfind("\n", 0, budget) + 1 or budget
     headers = list(_FILE_HEADER.finditer(diff))
     ends = [header.start() for header in headers[1:]] + [len(diff)]
     cut_partway = [
@@ -1162,6 +1163,7 @@ def diff_text(base: str, head: str) -> str:
 
 def codebase_snapshot() -> str:
     paths = sorted(path for path in run_git(["ls-files"]).splitlines() if include_file(path))
+    budget = review_budget()
     sections = []
     total = 0
     manifest = redact("--- REVIEW SNAPSHOT ORDER ---\n" + "\n".join(paths) + "\n")
@@ -1173,8 +1175,8 @@ def codebase_snapshot() -> str:
         except OSError:
             continue
         section = redact(f"--- FILE: {path} ---\n{content}\n")
-        if total + len(section) > MAX_REVIEW_CHARS:
-            remaining = MAX_REVIEW_CHARS - total
+        if total + len(section) > budget:
+            remaining = budget - total
             if remaining > 200:
                 sections.append(section[:remaining] + "\n--- SNAPSHOT TRUNCATED ---\n")
             break
@@ -1228,10 +1230,13 @@ FAILED_BANNER = "**The review did not run.**"
 # review called the cut "truncated mid-string" and asked whether it was a syntax
 # error, and never mentioned the files after it.
 #
-# A cut review is named, not failed. The reader is told which files were not
-# read, so the unreviewed part is KNOWN -- the line the truncated-answer case
-# draws -- and a large PR cannot get under the cap except by splitting, so red
-# here would block every kit sync. The gate passes it with a warning.
+# A cut review is named AND failed. It was named and passed with a warning at
+# first (kit #284), on the argument that a known gap is not an unknown one. The
+# review of the rollout (capaz#14) showed why that was wrong: the author decides
+# what comes first in a diff, so padding the head pushes the change that matters
+# past the cut and the check still passes. The unreviewed files are listed so
+# the author knows what to split out; a repo whose PRs are routinely larger
+# raises CLAUDE_REVIEW_MAX_CHARS (review_budget) rather than editing this file.
 STATUS_PARTIAL = "partial"
 PARTIAL_BANNER = "> **Partial: this diff was larger than the review budget.**"
 
@@ -1306,9 +1311,23 @@ def max_tokens_from_env() -> int:
     a mistyped repository variable unnoticed for as long as nobody reads the
     job log closely.
     """
-    raw = os.getenv("CLAUDE_REVIEW_MAX_TOKENS", "").strip()
+    return _positive_int_from_env("CLAUDE_REVIEW_MAX_TOKENS", DEFAULT_CLAUDE_REVIEW_MAX_TOKENS)
+
+
+def review_budget() -> int:
+    """Characters of diff the model reads: CLAUDE_REVIEW_MAX_CHARS, or MAX_REVIEW_CHARS.
+
+    A diff past this fails the check (see STATUS_PARTIAL), so a repo whose PRs
+    are routinely larger raises it with a repository variable instead of
+    editing a vendored file. Same parsing as max_tokens_from_env.
+    """
+    return _positive_int_from_env("CLAUDE_REVIEW_MAX_CHARS", MAX_REVIEW_CHARS)
+
+
+def _positive_int_from_env(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
     if not raw:
-        return DEFAULT_CLAUDE_REVIEW_MAX_TOKENS
+        return default
     try:
         value = int(raw)
     except ValueError:
@@ -1319,11 +1338,11 @@ def max_tokens_from_env() -> int:
     if value > 0:
         return value
     print(
-        f"::warning::CLAUDE_REVIEW_MAX_TOKENS={raw!r} is not a positive integer; "
-        f"using the script default {DEFAULT_CLAUDE_REVIEW_MAX_TOKENS}.",
+        f"::warning::{name}={raw!r} is not a positive integer; "
+        f"using the script default {default}.",
         file=sys.stderr,
     )
-    return DEFAULT_CLAUDE_REVIEW_MAX_TOKENS
+    return default
 
 
 def usage_summary(model: str, usage: dict[str, int] | None) -> str:
@@ -1804,7 +1823,10 @@ def call_claude(review_text: str, review_scope: str = "diff") -> str:
 
 def mark_partial(body: str, note: str) -> str:
     """Put the cut at the top of a finished review, where it is read first."""
-    banner = f"{PARTIAL_BANNER} {note} Review the rest directly, or split the PR.\n\n"
+    banner = (
+        f"{PARTIAL_BANNER} {note} Split the PR, or raise the CLAUDE_REVIEW_MAX_CHARS"
+        f" repository variable (now {review_budget():,}), and re-run.\n\n"
+    )
     head, header, rest = body.partition("## Claude Code Review\n\n")
     if not header:
         return banner + body

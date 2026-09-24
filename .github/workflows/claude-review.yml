@@ -97,6 +97,10 @@ jobs:
       # int() and falls through). The one repo that needed a higher ceiling had
       # edited this line by hand and tripped standards-drift doing it.
       CLAUDE_REVIEW_MAX_TOKENS: ${{ vars.CLAUDE_REVIEW_MAX_TOKENS }}
+      # The review budget in characters of diff, set the same way. A diff past
+      # it fails the check (`partial` below), so a repo whose PRs are routinely
+      # larger raises this rather than splitting every one.
+      CLAUDE_REVIEW_MAX_CHARS: ${{ vars.CLAUDE_REVIEW_MAX_CHARS }}
       REVIEW_PROJECT_NAME: ${{ github.repository }}
       PR_NUMBER: ${{ github.event.pull_request.number || '' }}
       BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
@@ -247,13 +251,19 @@ jobs:
               fi
               ;;
             partial)
-              # The diff was bigger than the review budget. Unlike `truncated`,
-              # the gap is KNOWN: the comment names every file the model did not
-              # read. A large PR cannot get under the cap except by splitting, so
-              # this warns rather than blocks -- but it is never reported as ok.
-              echo "::warning::The Claude review covered only part of this diff: it was" \
-                   "larger than the review budget. The PR comment names the files it did" \
-                   "not read; review those directly."
+              # The diff was bigger than the review budget; the comment names
+              # every file the model did not read. This only warned at first
+              # (kit #284). It blocks because the author decides what comes first
+              # in a diff: padding the head pushed the change that mattered past
+              # the cut while the check passed. Raised in review on capaz#14.
+              # The budget in effect is printed by the script, in the PR comment,
+              # not echoed here: the raw variable can be a typo the script
+              # rejected, and "currently lots" would name a budget nobody used.
+              echo "::error::The Claude review read only part of this diff: it is larger than" \
+                   "the review budget. The PR comment names the files it did not read and" \
+                   "the budget that was used. Split the PR, or raise the" \
+                   "CLAUDE_REVIEW_MAX_CHARS repository variable, and re-run."
+              exit 1
               ;;
             truncated)
               echo "::error::The Claude review hit its output-token ceiling and is incomplete," \
