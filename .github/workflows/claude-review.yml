@@ -97,10 +97,14 @@ jobs:
       # int() and falls through). The one repo that needed a higher ceiling had
       # edited this line by hand and tripped standards-drift doing it.
       CLAUDE_REVIEW_MAX_TOKENS: ${{ vars.CLAUDE_REVIEW_MAX_TOKENS }}
-      # The review budget in characters of diff, set the same way. A diff past
-      # it fails the check (`partial` below), so a repo whose PRs are routinely
-      # larger raises this rather than splitting every one.
+      # Characters of diff in one model call, set the same way. A longer diff
+      # is read whole, in parts of this size, so raising it means fewer and
+      # larger calls, not more of the diff read.
       CLAUDE_REVIEW_MAX_CHARS: ${{ vars.CLAUDE_REVIEW_MAX_CHARS }}
+      # What one review may cost in US dollars, set the same way; the script
+      # default is 5. The cost is estimated before any call, and a review over
+      # it does not run (`over-budget` below).
+      CLAUDE_REVIEW_MAX_USD: ${{ vars.CLAUDE_REVIEW_MAX_USD }}
       REVIEW_PROJECT_NAME: ${{ github.repository }}
       PR_NUMBER: ${{ github.event.pull_request.number || '' }}
       BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
@@ -152,9 +156,12 @@ jobs:
       # that already exist here, and fork PRs never enter the job (the `if:`
       # above). What must never happen is checking out head.sha with secrets in
       # the environment, and that is unchanged. The diff under review comes
-      # from the GitHub API by PR number, not from this checkout, so which
-      # base commit is on disk does not change WHAT gets reviewed; it changes
-      # which reviewer does the reviewing.
+      # from the GitHub API by PR number. A file the API sends without a patch
+      # is diffed by git from this checkout to pull/<n>/head, fetched as
+      # objects into a ref of the reviewer's own (claude_review.py, pr_diff):
+      # the PR's files are read, never checked out or run. fetch-depth: 0 below
+      # puts the merge base on disk, and the token this step leaves in the git
+      # config authenticates that fetch.
       #
       # workflow_dispatch has no pull request, so it falls back to the sha of
       # the ref it was dispatched on, as before.
@@ -251,18 +258,32 @@ jobs:
               fi
               ;;
             partial)
-              # The diff was bigger than the review budget; the comment names
-              # every file the model did not read. This only warned at first
-              # (kit #284). It blocks because the author decides what comes first
-              # in a diff: padding the head pushed the change that mattered past
-              # the cut while the check passed. Raised in review on capaz#14.
-              # The budget in effect is printed by the script, in the PR comment,
-              # not echoed here: the raw variable can be a typo the script
-              # rejected, and "currently lots" would name a budget nobody used.
-              echo "::error::The Claude review read only part of this diff: it is larger than" \
-                   "the review budget. The PR comment names the files it did not read and" \
-                   "the budget that was used. Split the PR, or raise the" \
-                   "CLAUDE_REVIEW_MAX_CHARS repository variable, and re-run."
+              # A file never reached the model: GitHub sent no patch for it and
+              # git could not produce one, or the files API listed fewer files
+              # than the PR changes (it stops at 3,000). The comment names each
+              # file it can, each cause, and the fix for that cause; this line
+              # points there, because a count that moved mid-run is fixed by a
+              # re-run and only a PR past the limit by a split.
+              # A gap like this only warned at first (kit #284). It blocks
+              # because an unread file is an unreviewed change, whatever the
+              # rest of the review says. Raised in review on capaz#14.
+              echo "::error::The Claude review read only part of this diff. The PR comment" \
+                   "says what it did not read, why, and what to do. A file it" \
+                   "could not get a diff for: fix the cause the job log names, then re-run." \
+                   "A PR past GitHub's 3,000-file limit: split it."
+              exit 1
+              ;;
+            over-budget)
+              # The estimated cost was over CLAUDE_REVIEW_MAX_USD, so nothing was
+              # sent to the model. The review body gives the size, the estimate
+              # and the cap in effect; the cap is not echoed here because the raw
+              # variable can be a typo the script rejected. A manual run posts no
+              # PR comment, so there the body is in the job summary.
+              echo "::error::The Claude review did not run: its estimated cost is over the" \
+                   "cap. The PR comment, or the job summary on a manual run, gives the size" \
+                   "and the estimate. The operator decides: raise the CLAUDE_REVIEW_MAX_USD" \
+                   "repository variable and re-run, split the PR, or, for a full-codebase" \
+                   "run, lower CLAUDE_REVIEW_MAX_CHARS."
               exit 1
               ;;
             truncated)

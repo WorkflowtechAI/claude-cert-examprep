@@ -29,6 +29,11 @@ Read this before writing a single line of code. Follow it without exception.
 4. **`docs/standards/coding-rules.md` is the law.** Where it conflicts with your
    training data, the file wins.
 
+5. **The wiki** documents every host, project, account, config and runbook:
+   GitHub `WorkflowtechAI/wiki`, checked out on the workstation at `D:\Projects\wiki`.
+   Read the page for the system you are touching before digging into it, and follow the
+   wiki's own `CLAUDE.md` when you write there.
+
 ---
 
 ## Communication Rules
@@ -212,7 +217,11 @@ A task is done when:
 2. Lint passes
 3. All relevant tests pass (add tests if none exist for new behavior)
 4. PR is open with a clear description
-5. Final status POSTed to `webhookUrl`
+5. If the work changed a system (deploy, host, service, port, env var name, new gotcha),
+   its wiki page says so, committed and pushed to `WorkflowtechAI/wiki`. When you learned
+   how a system works by digging, that goes on its page too. Pages name where a secret
+   lives, never its value. If the wiki is unreachable, the final status says what to add.
+6. Final status POSTed to `webhookUrl`
 
 Do not mark done if tests are failing. Do not mark done if you skipped lint. Do not mark done
 if you haven't verified the changes work as described.

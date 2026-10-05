@@ -21,8 +21,22 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from typing import NamedTuple
 
+# Characters of diff in one model call (review_budget). A longer diff is read
+# whole, in parts of at most this size (chunk_diff).
 MAX_REVIEW_CHARS = 120_000
+# What one review may cost, in US dollars (review_cap_usd). The cost is
+# estimated before any call, and a review over the cap does not run.
+DEFAULT_MAX_REVIEW_USD = 5.0
+# How that estimate counts, and both numbers are named wherever it is shown.
+# Output: 36 posted reviews across capaz and the kit used 1,370 to 20,121
+# output tokens a call, most of them 5,000 to 11,000.
+CHARS_PER_TOKEN = 4
+OUTPUT_TOKENS_PER_CALL = 12_000
+# Part reviews in flight at once, after the first (review_in_parts).
+REVIEW_WORKERS = 4
 # Must match Anthropic's model ID and the default in .github/workflows/claude-review.yml.
 DEFAULT_CLAUDE_REVIEW_MODEL = "claude-sonnet-5"
 # Tunable per repo without editing a vendored file. This script is copied into
@@ -37,8 +51,11 @@ DEFAULT_CLAUDE_REVIEW_MODEL = "claude-sonnet-5"
 # reasoning in front of it. Repos that raised CLAUDE_REVIEW_MAX_TOKENS in their
 # own workflow to work around this no longer need to.
 DEFAULT_CLAUDE_REVIEW_MAX_TOKENS = 32000
-DEFAULT_INPUT_PRICE_USD_PER_MILLION = 3.0
-DEFAULT_OUTPUT_PRICE_USD_PER_MILLION = 15.0
+# Anthropic's list price for DEFAULT_CLAUDE_REVIEW_MODEL. These read $3/$15,
+# Sonnet 4.6's price, for as long as the model was claude-sonnet-5, so every
+# posted cost was 50% over the bill.
+DEFAULT_INPUT_PRICE_USD_PER_MILLION = 2.0
+DEFAULT_OUTPUT_PRICE_USD_PER_MILLION = 10.0
 DEFAULT_CACHE_CREATION_INPUT_PRICE_MULTIPLIER = 1.25
 DEFAULT_CACHE_READ_INPUT_PRICE_MULTIPLIER = 0.10
 
@@ -78,6 +95,22 @@ _TYPE_WORD = (
 )
 _TYPE = _TYPE_WORD + r"(?:[ \t]*\|[ \t]*" + _TYPE_WORD + r")*"
 
+# THE NAMES THE TABLE KNOWS, AND WHAT SEPARATES ONE FROM ITS VALUE: the key group
+# and the separator of the assignment rule in SECRET_PATTERNS, named so that
+# anything else asking "does a key start here" asks the table's own question
+# rather than a copy of it. A name one spelling knows and the other does not is
+# a key the two disagree about, and that disagreement only ever shows up as a
+# leak.
+#
+# The separator carries its own refusal: a `:?` that a `}` closes later on the
+# line opens a required-variable expansion (`_PARAM_EXPANSION`), not a value.
+_SECRET_NAME = (
+    r"(?:api[_-]?key|access[_-]?key|private[_-]?key"
+    r"|secret(?:[_-]?access)?[_-]?key(?:[_-]?base)?"
+    r"|token|secret|password|passwd|client[_-]?secret)"
+)
+_SEPARATOR = r"(?!:\?[^}\n]*\})(?:=>|:=|[+.]=|[:=](?![=>]))"
+
 # An env-var lookup NAMES a secret without containing one, the same category as
 # the `${{ secrets.X }}` expression the pattern already leaves alone, and it is
 # exempted for the same reason: redacting it rewrites working code into
@@ -107,9 +140,16 @@ _TYPE = _TYPE_WORD + r"(?:[ \t]*\|[ \t]*" + _TYPE_WORD + r")*"
 # and `token=<REDACTED>` reads as valid code, which is all this exemption is
 # for. The shape that broke was the trailing ` or ""`, not the lookup itself.
 # Every one of those is pinned by an exact-output test.
+#
+# THE JS NAME ENDS AT ITS LAST WORD CHARACTER (`(?!\w)`), so it cannot give
+# letters back to find an end. `_NAMES_NOT_VALUES` refuses a word character
+# after the lookup; without this, `\w*` backtracked one letter at a time, so
+# `process.env.TOKEN]hunter2` matched as `process.env.TOKE` with `N` after it,
+# and the fallback-literal scan below re-ran at every letter, quadratic in the
+# length of the name.
 _ENV_LOOKUP = (
     r"(?:(?:os\.environ\.get|os\.getenv)[ \t]*\([ \t]*[\"'][A-Za-z_][A-Za-z0-9_]*[\"'][ \t]*\)"
-    r"|process\.env\.[A-Za-z_]\w*)"
+    r"|process\.env\.[A-Za-z_]\w*(?!\w))"
     r"(?![^\n]*[\"'][^\"'\n]+[\"'])"
 )
 
@@ -161,8 +201,9 @@ _ENV_LOOKUP = (
 #     alphanumeric secret wrapped in braces is the residual case, and it is
 #     accepted knowingly -- this is a heuristic in front of a model, not a
 #     boundary. `{"k": "v"}` has a quote and is not a placeholder, nor is `{a}{b}`.
-# (3) EACH of them must END the value -- the next character is a quote,
-#     whitespace, or a separator -- so `api_key=(.*)hunter2` is not exempt.
+# (3) EACH of them must END the value: a quote or whitespace follows it, or
+#     `_VALUE_END` does (`_NAMES_NOT_VALUES` applies both), so
+#     `api_key=(.*)hunter2` and `api_key=(.*)]hunter2` are not exempt.
 # (4) A JAVASCRIPT REGEX LITERAL IS THE SAME CATEGORY ONE DELIMITER OVER, and
 #     (1) reads the value's FIRST character, which for `/(?:a|b)/` is the slash
 #     rather than the group. So the group branch never fired on one, and this
@@ -209,7 +250,6 @@ _PATTERN_OR_PLACEHOLDER = (
     # `[dgimsuvy]` would otherwise take eight letters of anything.
     r"|/(?=%(B)s{0,120}?%(I)s)%(B)s{1,200}/(?-i:[dgimsuvy]{0,8})"
     r")"
-    r"(?=[\"'\s,;)\]]|$)"
 ) % {"I": _REGEX_IDIOM, "B": _REGEX_BODY}
 
 # A VARIABLE RESHAPING ITSELF CARRIES NOTHING NEW.
@@ -257,18 +297,147 @@ _SELF_RESHAPE = (
     r"|\[(?![^\[\]\n]*[A-Za-z0-9]{8})[^\[\]\n]*\])+"
 )
 
-# What the value rule refuses to treat as a value. One name so the branch that
-# uses it reads as the question it asks.
-# THE CHAIN MUST END THE VALUE, and the terminator is deliberately NOT the
-# `\s` the other two branches accept. With whitespace allowed,
-# `token = token.strip() or "hunter2"` matched the chain, hit the space, and
-# went exempt WITH THE LITERAL STILL ON THE LINE -- an exemption written to stop
-# a false finding, turning a redacted line into a leak. Measured before it
-# shipped. A closer or the end of the line only, so anything following the chain
-# means the value is an expression and is redacted whole.
-_NAMES_NOT_VALUES = r"(?:%s|%s|%s(?=[,;)\]}]|[ \t]*$))" % (
-    _ENV_LOOKUP, _PATTERN_OR_PLACEHOLDER, _SELF_RESHAPE,
+# WHERE AN EXEMPT VALUE ENDS, for all five exemptions: the three names joined
+# below, the expansion and the number. An exempt value ends where the bare value
+# would end, or the text between the two ends reaches the model unredacted. The
+# bare value stops at whitespace, a quote, `,`, `;`, `)` and a glued key, and
+# reads through `]` and `}`. So an exempt value ends at:
+#
+# (1) a comment, `,`, `;`, `)` or the end of the line, after optional blanks.
+#     An operator is not an end: the concatenation chain may be carrying a
+#     literal, so `token = 4 + "hunter2"` redacts whole.
+# (2) a closer after blanks (`{ token: 4 }`): the blank already ended the value,
+#     and no chain starts at a closer.
+# (3) a run of glued closers, when one of those or a quote follows the run.
+#     `f({token: token.strip()}).then(x)`, `log(f"[token={token}]")` and
+#     `'{"token": 4}'` stay as written. Text glued behind a closer is still the
+#     value, so the line redacts whole:
+#
+#         token = token.strip()]wJalrXUtnFEMI/K7MDENG  ->  token="<REDACTED>"
+#         token = process.env.TOKEN}hunter2            ->  token="<REDACTED>"
+#         token = 4]wJalrXUtnFEMI/K7MDENG              ->  token="<REDACTED>"
+#
+#     All three reached the model whole on main. Kit #327 gave the number
+#     alone a stricter end, and redacting there sent a glued second key to the
+#     bare branch; that branch now stops in front of the key (`_BARE_CHAR`), so
+#     declining an exempt value hands the key nothing.
+#
+# A quote ends the value only after a closer. The self-reshape chain reads
+# attribute names, so in `'token = token.hunter2'` a bare quote would end the
+# exempt span with the name inside it, where main redacts the line.
+#
+# ONE DEFINITION FOR ALL FIVE, so they agree on where a value stops. Each leak
+# above lived between two spellings of this end.
+_VALUE_END = (
+    r"(?=[\]}]*(?:[ \t]+(?:\#|[\]}])|[ \t]*(?:[,;)]|\r?\n|$))|[\]}]+[\"'])"
 )
+
+# What the value rule refuses to treat as a value. One name so the branch that
+# uses it reads as the question it asks. Each exemption ends at `_VALUE_END`,
+# plus what its own shape needs:
+#
+# THE ENV LOOKUP also ends at anything but a word character or a closer, since
+# the ` or ""` after it is the shape it exists for and its own lookahead
+# withdraws it when a literal follows. A word glued behind the call
+# (`os.getenv("X")hunter2`) is part of the value, so it redacts.
+#
+# A PATTERN OR PLACEHOLDER also ends at a quote or whitespace, since it usually
+# sits inside a string (`f"KEY={new_key}"`, `r"^KEY=(.*)$"`).
+#
+# THE SELF-RESHAPE CHAIN ends at `_VALUE_END` alone, deliberately WITHOUT the
+# whitespace the other two accept. With whitespace allowed,
+# `token = token.strip() or "hunter2"` matched the chain, hit the space, and
+# went exempt WITH THE LITERAL STILL ON THE LINE: an exemption written to stop
+# a false finding, turning a redacted line into a leak. Measured before it
+# shipped. Its old end, `[ \t]*$` without re.M, also matched only at the end of
+# the whole text, so on every other line of a diff the chain was redacted.
+_NAMES_NOT_VALUES = (
+    r"(?:%(E)s(?:(?![\]}\w])|%(V)s)"
+    r"|%(P)s(?:(?=[\"'\s])|%(V)s)"
+    r"|%(S)s%(V)s)"
+) % {"E": _ENV_LOOKUP, "P": _PATTERN_OR_PLACEHOLDER, "S": _SELF_RESHAPE, "V": _VALUE_END}
+
+# A REQUIRED-VARIABLE EXPANSION NAMES A SECRET WITHOUT CONTAINING ONE -- the
+# category of `${{ secrets.X }}` and the env lookups above, in the shell and
+# Docker Compose spelling. On capaz#21 the bare value stopped at the first space
+# INSIDE the braces:
+#
+#     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in infra/compose/.env}
+#     ->  POSTGRES_PASSWORD:"<REDACTED>" POSTGRES_PASSWORD in infra/compose/.env}
+#
+# and the reviewer reported the compose file as invalid YAML and a deploy
+# blocker, on a line `docker compose config` accepts.
+#
+# NARROWED SO IT CANNOT HIDE A VALUE.
+# (1) Only `${NAME:?message}` and `${NAME?message}`. The text after `?` is the
+#     error the shell or compose prints when NAME is unset, never the value.
+#     A default or alternate (`:-`, `-`, `:=`, `=`, `:+`, `+`) holds a literal
+#     that becomes the value, so it is redacted, and now WHOLE, through its
+#     closing brace, by the bare branch's own `${...}` alternative:
+#     `${PW:-correct horse}` used to leave `horse}` on the wire.
+# (2) A plain `${NAME}` and a bare `$NAME` stay redacted, as #56 pinned them:
+#     a literal can open with `$` wherever nothing interpolates, and
+#     `token="<REDACTED>"` parses, so leaving them buys no parse and costs a
+#     hole.
+# (3) The expansion must BE the value and end it (`_VALUE_END`), quoted or
+#     bare, after the enclosing string's closing quote in the compose list
+#     form `- "PW=${PW:?msg}"`. `${PW:?msg}hunter2`, `${PW:?msg}]hunter2` and
+#     `${PW:?msg} + "hunter2"` are values and redact whole.
+#
+# IT IS CONSUMED, NOT SKIPPED. A lookahead that declined the value would leave
+# the scan to restart inside the braces, where `PASSWORD:?set` is a key and a
+# separator of its own. The `ref` group takes the whole expansion and
+# `_redact_assignment` hands the match back exactly as written. The same key
+# INSIDE a longer value, a connection URL whose password is `${PW:?msg}`, is
+# refused at the separator instead: SECRET_PATTERNS reads a `:?` that a `}`
+# closes on the same line as an expansion operator, never as a separator.
+#
+# THE RESIDUALS, named in HARNESS.md: a secret typed as the MESSAGE reaches the
+# model (the vendor-prefix half below still catches a keyed format), and so does
+# a value glued to its colon that opens with `?` when a `}` follows later on the
+# line (`{password:?hunter2}`). Without that brace, `password:?hunter2` redacts.
+# The message is bounded at 200 characters, so a brace that never closes costs
+# one bounded attempt.
+_PARAM_EXPANSION = (
+    r"(?:\"%(R)s\"|'%(R)s'|%(R)s[\"']?)%(END)s"
+) % {"R": r"\$\{[A-Za-z_][A-Za-z0-9_]*:?\?[^}\n]{0,200}\}", "END": _VALUE_END}
+
+# A NUMBER UNDER A `token` NAME IS A COUNT. The name rule matches `token` on its
+# tail, so every per-token constant in a model client reads as a credential:
+#
+#     CHARS_PER_TOKEN = 4   ->  CHARS_PER_TOKEN="<REDACTED>"
+#
+# The reviewer on kit #314 then called CHARS_PER_TOKEN "a redacted string
+# constant" and asked whether it was a string used in arithmetic. A quoted
+# placeholder where the source holds an integer is the phantom finding every
+# exemption above was written for. `MAX_TOKENS = 32000` and
+# `OUTPUT_TOKENS_PER_CALL = 12_000` were already left alone: `tokens` is a
+# different name, and its `S` ends the match before any separator.
+#
+# NARROWED SO IT CANNOT HIDE A VALUE.
+# (1) The `token` name only, through the `tok` group. Every other name in the
+#     key list keeps redacting a number, swept one by one: the `_key` family,
+#     `secret`, `client_secret`, `password` and `passwd`. `password = 1234` is a
+#     PIN, and a number under the rest can be a key id or a seed.
+# (2) A bare number only: a digit, then digits and `_`, then at most one decimal
+#     point. A quote, a letter, a sign or an exponent makes it a value, so
+#     `token = "123456"`, `token = 0x1F` and `token = 3e-6` redact as before.
+#     ASCII digits only, spelled `[0-9]`: `\d` in a str pattern is any Unicode
+#     digit, so `API_TOKEN = ` followed by fullwidth or Arabic-Indic digits
+#     reached the model, and no source writes a count in those.
+# (3) The number ENDS the value (`_VALUE_END`). The Telegram bot token shape,
+#     `BOT_TOKEN = 123456789:AAH...`, opens with digits and runs on past the
+#     colon, so it redacts whole, and `token = 4 + "hunter2"` still takes the
+#     literal with it.
+# (4) A type annotation in front is read through, so `CHARS_PER_TOKEN: int = 4`
+#     stays whole as well; without it the no-annotation retry redacted the type
+#     word and left `= 4` behind it.
+#
+# THE RESIDUAL: a credential made only of digits under a `token` name (a
+# six-digit one-time code, a numeric PIN someone named a token) reaches the
+# model. No vendor entry below is all digits, so the prefix half leaves it too.
+# Pinned by test_the_residual_is_pinned_not_assumed and named in HARNESS.md.
+_NUMBER = r"[0-9][0-9_]*(?:\.[0-9_]*)?" + _VALUE_END
 
 # A STRING LITERAL'S PREFIX IS PART OF THE LITERAL, and the value branch read it
 # as a bare value that happened to end where a quote began. So only the prefix
@@ -390,8 +559,9 @@ _CONCAT_LITERAL = (
 # still one value.
 #
 # TWO ALTERNATIVES ON DISJOINT CHARACTER SETS, so the ordinary characters -- all
-# but three of them -- take the first branch with no lookahead at all, and only
-# a literal `+`, `.` or `&` pays for one. RedactionIsLinear pins the cost.
+# but three of them -- take the first branch with no literal lookahead, and only
+# a literal `+`, `.` or `&` pays for one. The key check in front of both (below)
+# is the one lookahead every character pays. RedactionIsLinear pins the cost.
 # THE SYMBOL OPERATORS, ONCE. The chain below matches these, and the bare class
 # above has to stop in front of exactly these -- two spellings of one set, and
 # when the set grew (`%`, `||`, `??`) only one of them grew. That is the fourth
@@ -422,9 +592,26 @@ _CHAIN_OP = r"(?:\.{1,2}|\|\||\?\?|[+&%])"
 # That is the same defect as a hand-written pin inheriting the shape that
 # motivated it, one level up -- an axis that cannot express the asymmetry cannot
 # find it. The axes vary independently now.
+#
+# A KEY GLUED INTO A BARE VALUE ENDS IT. The bare value read through a key and
+# its separator like any other text, so one match swallowed the next key and
+# the scan resumed past that key's value:
+#
+#     token = abc]password: hunter2  ->  token="<REDACTED>" hunter2
+#     token = 4]password: hunter2    ->  token="<REDACTED>" hunter2
+#
+# Every key the table knows (`_SECRET_NAME`, then `_SEPARATOR` across the gap
+# the table allows) now ends the bare value in front of it, so the scan
+# restarts at that key and redacts its value. This is what lets an exemption
+# decline a value safely: on review of #327, declining
+# `password: ${PW:?m}]password: hunter2` sent `hunter2` to the model through
+# exactly this path. The check is a lookahead every character pays, and it
+# fails on the first letter for almost all of them; the kit's own tree
+# redacts no slower than before.
 _BARE_CHAR = (
-    r"(?:[^\s'\",;)+.&%%|?]|(?!%(O)s[ \t]*%(Q)s)[+.&%%|?])"
-) % {"O": _CHAIN_OP, "Q": _CONCAT_LITERAL}
+    r"(?:(?!%(K)s(?:[\"'][ \t]*|\s*)%(S)s)"
+    r"(?:[^\s'\",;)+.&%%|?]|(?!%(O)s[ \t]*%(Q)s)[+.&%%|?]))"
+) % {"O": _CHAIN_OP, "Q": _CONCAT_LITERAL, "K": _SECRET_NAME, "S": _SEPARATOR}
 
 # A call or a subscript, as the value branch spells one, without its named group
 # -- AND ENDING THE SAME WAY IT DOES. For one round it did not: the value branch
@@ -587,6 +774,12 @@ def _redact_assignment(m: "re.Match[str]") -> str:
     pretty. Said out loud because it is the kind of lossy detail a reviewer
     reasonably flags as a bug. Raised on review of #177.
     """
+    # A required-variable expansion goes back exactly as written. The match
+    # consumed it, so the key inside its braces is never matched again
+    # (`_PARAM_EXPANSION`). Read first and by name: a pattern that lost `ref`
+    # raises here and falls back to the total redaction, never to a pass.
+    if m.group("ref") is not None:
+        return m.group(0)
     # The author's own quote where the value had one -- `\'` and `"` are not
     # interchangeable everywhere, and in SQL a double-quoted token is an
     # IDENTIFIER, so swapping them changes meaning rather than formatting.
@@ -678,7 +871,7 @@ _REDACT_FALLBACK_WARNED = False
 def redact_assignment(m: "re.Match[str]") -> str:
     """`_redact_assignment`, but a broken pattern degrades instead of exploding.
 
-    The function above reads `key`, `q`, `sep`, `qv`, `seam` and `seamq` BY
+    The function above reads `ref`, `key`, `q`, `sep`, `qv`, `seam` and `seamq` BY
     NAME. A future regex edit that renames or drops one raises IndexError
     inside re.sub -- and
     `redact()` runs before anything is sent, so the whole review step dies and NO
@@ -718,6 +911,46 @@ def redact_assignment(m: "re.Match[str]") -> str:
         return "<REDACTED>"
 
 
+# NO KEY PREFIX MATCHES MID-IDENTIFIER.
+#
+# Every vendor entry in `_VENDOR_KEYS` below names a prefix and none of them
+# anchored it, so each one also fired inside a longer word: `TASK` + 32 hex
+# matched the Twilio rule and came back `TASK<REDACTED>`, as did `MASK` and
+# `FLASK`. That is the safe direction -- a benign token blanked, not a real one
+# leaked -- but a redactor that eats identifiers hands the model a diff with
+# holes in it, and the model then reviews the holes. Raised in review on #196
+# against the `SK` entry alone; measured across the table it was 20 of 20, so
+# the boundary went on once, at the build site, rather than twenty times.
+#
+# The two key entries written out in this table, `sk-` and `AKIA`, sat above
+# that build site and never got it. So a capaz category code for help desk and
+# end-user support reached the model as `help-desk-<REDACTED>`: the `sk-`
+# inside `desk-`, plus the twenty characters after it, is an OpenAI key by
+# shape. The CI reviewer on capaz#16 then reported its own redaction as
+# blocking data corruption in a pack file that was correct. The boundary is
+# defined here, above the table, so every key-shape entry takes it, and
+# `test_every_key_shape_entry_carries_the_boundary` enumerates the table to
+# keep it that way.
+#
+# The class is word characters only. `-` is deliberately out: after a hyphen a
+# prefix genuinely begins a new token, and matching there keeps the bias toward
+# over-redaction on the one case where the two directions disagree.
+#
+# AN ESCAPE OR A PERCENT-ENCODED BYTE ENDS A WORD TOO. `\n`, `\r` and `\t` in a
+# string literal and `%3D` in a URL or a form body are one character spelled as
+# two or three, and the last of them is a word character. Read as part of a
+# word, they hid the key behind them: on review of #306, `"line1\nsk-..."`,
+# `"\tAKIA..."` and `a%3Dsk-...` reached the model whole, each one redacted
+# before these two entries took the boundary. So the boundary also opens right
+# after `\n`, `\r`, `\t` or `%XX`, which reaches every vendor entry as well.
+# `desk-` is still one word. A key glued to any other word character
+# (`key_sk-...`, a `\x41` escape) is the blind spot HARNESS.md names.
+#
+# Zero-width and non-capturing, so `\1` is still the prefix and the one-group
+# invariant holds.
+_NOT_MID_IDENTIFIER = r"(?:(?<![A-Za-z0-9_])|(?<=\\[nrt])|(?<=%[0-9A-Fa-f]{2}))"
+
+
 SECRET_PATTERNS = [
     # The key=value rule. A heuristic last line in front of the model, not a
     # substitute for keeping secrets out of commits: the name list is short on
@@ -741,7 +974,12 @@ SECRET_PATTERNS = [
     # `password == other` is a comparison, and matching its first `=` redacted
     # the second and left the line unable to parse. `'password' => 'hunter2'` used to slip through
     # the same gap as the JSON key below. A match arm, `token => x` or
-    # `token => f(x)`, is redacted, an accepted over-redaction.
+    # `token => f(x)`, is redacted, an accepted over-redaction. Nor is a `:?`
+    # that opens an expansion closing on the same line: it is the
+    # required-variable operator of `${PASSWORD:?msg}`, and reading it as a
+    # separator redacted the message inside a connection URL
+    # (`_PARAM_EXPANSION` says why). With no `}` after it, `:?` is a separator
+    # like any other, so `password:?hunter2` redacts.
     #
     # A `${{ secrets.X }}` expression names a secret without containing one.
     # Redacting it rewrote `ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}`
@@ -796,6 +1034,14 @@ SECRET_PATTERNS = [
     # at the end of its line, which cannot be told from a key; on the key's
     # own line a value ending in `:` is a value and is redacted.
     #
+    # The spaces between the separator and the value have ONE reading. The run
+    # after the line break sits inside the optional group, so a run on the
+    # key's own line belongs to the first `[ \t]*` alone. With that run after
+    # the group instead, the two could share K spaces in about K*K/2 ways, and
+    # a value the rule then declined (an exempt number, or no value at all)
+    # made the engine try every one: `token = ` + 8,000 spaces + `4` took 41
+    # seconds. RedactionIsLinear times the shape at 50,000.
+    #
     # A value that opens a call is redacted WHOLE, through its closing paren.
     # `brokerApiKey: resolveKey("LITELLM_API_KEY"),` used to come out as
     # `brokerApiKey=<REDACTED>LITELLM_API_KEY"),`: the bare branch stopped at
@@ -832,26 +1078,37 @@ SECRET_PATTERNS = [
     # (`{ token: "h" }`) stays redacted, and typing generics (`Optional[str]`)
     # are not in the set and still redact as a subscript.
     #
+    # A REQUIRED-VARIABLE EXPANSION, `${NAME:?msg}` or `${NAME?msg}`, is group
+    # `ref` and comes back exactly as written; `_PARAM_EXPANSION` says which
+    # forms qualify and why. Any other `${...}` is a value and is consumed
+    # through its closing brace, so nothing after a space inside it dangles.
+    #
+    # A BARE NUMBER under the `token` name (group `tok`) is a count and stays as
+    # written, annotation included; `_NUMBER` says which shapes qualify and why.
+    # `tok` is set by a lookbehind on the key rather than by an alternative of
+    # its own, and the lookbehind has a negative twin, so a `token` key has ONE
+    # way through the group. An optional group, or `(?P<tok>token)` ahead of a
+    # list that also holds `token`, would let a declined number backtrack to
+    # the path without `tok`, skip the number test and redact the count.
+    #
     # re.VERBOSE, so the branches can sit one per line: whitespace outside a
     # character class is layout, not pattern. Named groups, so the conditionals
     # and the replacement read as what they test rather than as a number.
     (
         re.compile(
             r"""
-            (?P<key>
-                api[_-]?key | access[_-]?key | private[_-]?key
-              | secret(?:[_-]?access)?[_-]?key(?:[_-]?base)?
-              | token | secret | password | passwd | client[_-]?secret
-            )
+            (?P<key>%(K)s)(?:(?<=token)(?P<tok>)|(?<!token))
             (?P<q>["'])?
-            (?(q)[ \t]*|\s*)(?P<sep>=>|:=|[+.]=|[:=](?![=>]))
+            (?(q)[ \t]*|\s*)(?P<sep>%(S)s)
             (?(q)[ \t]*
-              |[ \t]*(?:\r?\n(?:[-+ ]|(?![-+ ]))(?![ \t]*[\w.-]+:(?:[ \t]|\r?\n|$)))?[ \t]*)
+              |[ \t]*(?:\r?\n(?:[-+ ]|(?![-+ ]))(?![ \t]*[\w.-]+:(?:[ \t]|\r?\n|$))[ \t]*)?)
             (?P<seam>(?P<seamq>["'])[ \t]*(?:\+|\.{1,2}|&)[ \t]*(?=["']))?
             (?:(?P<type>%(T)s))?(?(type)[ \t]*=[ \t]*|)
             (?(type)|(?!%(E)s))
+            (?(tok)(?!(?:%(T)s[ \t]*=[ \t]*)?%(N)s))
             (?:
-                %(P)s?
+                (?P<ref>%(R)s)
+              | %(P)s?
                 (?P<qv>
                   "(?![ \t]*\$\{\{)(?:[^"\\\n]|\\.|"")*"
                 | '(?![ \t]*\$\{\{)(?:[^'\\\n]|\\.|'')*'
@@ -863,19 +1120,21 @@ SECRET_PATTERNS = [
                     (?:[A-Za-z_$][\w.]*)?
                     (?:\((?:[^()\n]|\((?:[^()\n]|\([^()\n]*\))*\))*\)|\[[^\[\]\n]*\])+
                     %(V)s*
+                  | \$\{(?=[A-Za-z_])[^}\n]{1,200}\}%(V)s*
                   | ["'](?!\$\{\{)[^\s'",;)]+["']?
                   | (?!\$\{\{)%(V)s+
                 )
             )
             %(C)s
             """ % {"T": _TYPE, "E": _NAMES_NOT_VALUES, "C": _CONCAT_CHAIN,
-                   "V": _BARE_CHAR, "P": _LITERAL_PREFIX},
+                   "V": _BARE_CHAR, "P": _LITERAL_PREFIX, "R": _PARAM_EXPANSION,
+                   "N": _NUMBER, "K": _SECRET_NAME, "S": _SEPARATOR},
             re.I | re.X,
         ),
         redact_assignment,
     ),
-    (re.compile(r"sk-[A-Za-z0-9_-]{20,}"), "sk-<REDACTED>"),
-    (re.compile(r"AKIA[0-9A-Z]{16}"), "AKIA<REDACTED>"),
+    (re.compile(_NOT_MID_IDENTIFIER + r"sk-[A-Za-z0-9_-]{20,}"), "sk-<REDACTED>"),
+    (re.compile(_NOT_MID_IDENTIFIER + r"AKIA[0-9A-Z]{16}"), "AKIA<REDACTED>"),
     (
         re.compile(
             r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S
@@ -978,27 +1237,10 @@ _VENDOR_KEYS = (
 # accepted: a loose length invites collisions, and a vendor changing its token
 # format is a thing someone notices.
 
-# NO VENDOR PREFIX MATCHES MID-IDENTIFIER.
-#
-# Every entry above names a prefix and none of them anchored it, so each one
-# also fired inside a longer word: `TASK` + 32 hex matched the Twilio rule and
-# came back `TASK<REDACTED>`, as did `MASK` and `FLASK`. That is the safe
-# direction -- a benign token blanked, not a real one leaked -- but a redactor
-# that eats identifiers hands the model a diff with holes in it, and the model
-# then reviews the holes. Raised in review on #196 against the `SK` entry
-# alone; measured across the table it was 20 of 20, so the boundary is applied
-# once here rather than spelled twenty times.
-#
-# The class is word characters only. `-` is deliberately out: after a hyphen a
-# prefix genuinely begins a new token, and matching there keeps the bias toward
-# over-redaction on the one case where the two directions disagree.
-#
-# Zero-width, so `\1` is still the prefix and the one-group invariant holds.
-_NOT_MID_IDENTIFIER = r"(?<![A-Za-z0-9_])"
-
 # Built rather than written out, so a vendor is one line and the replacement
 # cannot drift from the pattern -- the failure this file met four times in one
-# week was an atom spelled twice and fixed once.
+# week was an atom spelled twice and fixed once. Each entry takes
+# `_NOT_MID_IDENTIFIER`, defined above SECRET_PATTERNS.
 SECRET_PATTERNS += [
     (re.compile(_NOT_MID_IDENTIFIER + pattern), r"\1<REDACTED>")
     for pattern in _VENDOR_KEYS
@@ -1078,35 +1320,223 @@ def include_file(path: str) -> bool:
     return allowed and not excluded
 
 
-def pr_diff() -> str:
+# Where fetch_pr_head() puts the PR head. A namespace of the reviewer's own, so
+# no branch, remote-tracking ref or tag in the checkout is overwritten.
+PR_HEAD_REF = "refs/claude-review/pr-head"
+
+
+def fetch_pr_head(pr_number: str) -> bool:
+    """Fetch the PR head's objects into PR_HEAD_REF. True when they arrived.
+
+    This job runs as pull_request_target with secrets, so the PR is never
+    checked out. A fetch writes objects and one ref; nothing from the PR runs.
+    It authenticates with the token actions/checkout leaves in the local git
+    config, so the token never appears on a command line.
+
+    It brings no new objects onto the runner. The workflow runs only for a PR
+    from this repository (its `if:`), and checkout's fetch-depth: 0 has already
+    fetched every branch, the PR's head branch included. Raised in review on
+    #311 as a new attack surface; it is a new ref name over objects on disk.
+
+    The number goes into the refspec, so it is ASCII digits or nothing is
+    fetched: the refspec names refs/pull/<number>/head and no other ref. The
+    caller then names the files it could not diff, and the review fails.
+    """
+    if not (pr_number.isascii() and pr_number.isdigit()):
+        print(
+            f"claude_review: PR_NUMBER={pr_number!r} is not a pull request number,"
+            " so the PR head was not fetched",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        run_git([
+            "fetch", "--no-tags", "--quiet", "origin",
+            f"+refs/pull/{pr_number}/head:{PR_HEAD_REF}",
+        ])
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"claude_review: could not fetch pull/{pr_number}/head: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
+def git_file_diff(file_info: dict) -> str:
+    """One file's diff, from git, for a file the files API sent without a patch.
+
+    `HEAD...PR_HEAD_REF` diffs from the merge base, the comparison the files API
+    makes; HEAD is the base branch the workflow checked out. Default context,
+    as in the API's patches, so the parts and the cost estimate weigh both kinds
+    alike. The old
+    path of a rename goes in the pathspec so git shows a rename, not a new file.
+    --no-ext-diff and --no-textconv keep git to its built-in diff whatever the
+    config says, and --literal-pathspecs reads a `*` in a filename as a `*`.
+    Blank when git fails or finds no change, and the job log says which, so the
+    caller reports the file instead of dropping it.
+    """
+    filename = file_info["filename"]
+    paths = [filename]
+    if file_info.get("previous_filename"):
+        paths.insert(0, file_info["previous_filename"])
+    try:
+        diff = run_git([
+            "--literal-pathspecs", "-c", "core.quotePath=false",
+            "diff", "--no-ext-diff", "--no-textconv", "-M",
+            f"HEAD...{PR_HEAD_REF}", "--", *paths,
+        ])
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"claude_review: git could not diff {filename}: {exc}", file=sys.stderr)
+        return ""
+    if not diff.strip():
+        print(f"claude_review: git found no change to {filename} in the PR head", file=sys.stderr)
+    return diff
+
+
+# The most files GitHub's files API lists for one PR. The REST docs for "List
+# pull requests files" say "Responses include a maximum of 3000 files". Past it
+# a page comes back empty, not as an error: DefinitelyTyped#67085 gave 100 files
+# on each of pages 1 to 30 and none on page 31.
+FILES_API_LIMIT = 3000
+
+# Every GitHub request goes here. A test points it at a loopback server.
+GITHUB_API = "https://api.github.com"
+
+
+def github_get(path: str, token: str):
+    """One GitHub REST resource, such as `repos/o/r/pulls/1`, parsed from JSON.
+
+    urllib's default opener copies the bearer token onto a redirect to any host
+    (see _NoRedirect), so _GITHUB_OPENER refuses redirects: one raises
+    HTTPError, the same as any other failed request.
+    """
+    request = urllib.request.Request(
+        f"{GITHUB_API}/{path}",
+        headers={
+            "accept": "application/vnd.github+json",
+            "authorization": f"Bearer {token}",
+            "x-github-api-version": "2022-11-28",
+        },
+    )
+    with _GITHUB_OPENER.open(request, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def pr_changed_files(repo: str, pr_number: str, token: str) -> int | None:
+    """The PR's own `changed_files`, or None, with the reason in the job log.
+
+    None fails the review as partial (listing_gap) instead of crashing it, so the
+    review still runs and its comment still posts, saying to re-run.
+    """
+    try:
+        pull = github_get(f"repos/{repo}/pulls/{pr_number}", token)
+    except (OSError, ValueError) as exc:
+        print(f"claude_review: could not read pull {pr_number}: {exc}", file=sys.stderr)
+        return None
+    changed = pull.get("changed_files") if isinstance(pull, dict) else None
+    if not isinstance(changed, int):
+        print(f"claude_review: GitHub gave no changed_files for pull {pr_number}", file=sys.stderr)
+        return None
+    return changed
+
+
+def listing_gap(listed: int, changed: int | None) -> tuple[str, str]:
+    """What the files API did not list and what to do about it; blank when it listed all.
+
+    `changed` is the PR's own `changed_files`. It equalled the listed count on
+    each of 17 PRs measured, renames and deletions included, so a difference
+    below the limit means the PR moved between the two requests. At the limit
+    the count says nothing: DefinitelyTyped#67085 listed 3,000 files and
+    reported 0 changed, then 27,399 when read again. So a list that reaches the
+    limit fails even when the count matches it: a PR of exactly 3,000 files and
+    one cut at 3,000 list the same. None is a count GitHub did not give
+    (pr_changed_files).
+    """
+    def files(count: int) -> str:
+        return f"{count:,} file" + ("" if count == 1 else "s")
+
+    if listed >= FILES_API_LIMIT:
+        if isinstance(changed, int) and changed > listed:
+            reach = f"and this one changes {changed:,}, so {files(changed - listed)}"
+        else:
+            reach = "and stopped there, so any file this one changes beyond those"
+        return (
+            f"GitHub's files API lists at most {files(FILES_API_LIMIT)} of a PR {reach}"
+            " went unlisted and unreviewed.",
+            "Split the PR.",
+        )
+    if changed == listed:
+        return "", ""
+    if changed is None:
+        return (
+            f"GitHub's files API listed {files(listed)}, but GitHub gave no count of the"
+            " files this PR changes, so the review cannot tell whether it read them all.",
+            "The job log says why; re-run.",
+        )
+    effect = "the review may have missed some"
+    if changed < listed:
+        effect = "the reviewed diff may not match the PR as it is now"
+    return (
+        f"GitHub's files API listed {files(listed)}, but the PR says it changes"
+        f" {files(changed)}, so {effect}.",
+        "The PR may have changed while the reviewer read it; re-run.",
+    )
+
+
+def pr_diff() -> tuple[str, list[str], tuple[str, str]]:
+    """The PR's diff from the GitHub files API, the files with no diff to send,
+    and listing_gap() for the files the API never listed.
+
+    GitHub leaves `patch` out of a file whose diff is too large for the API.
+    Such a file was skipped here, so it was reviewed by nobody and named by
+    nothing: on capaz#57, five plan docs of 300 to 411 changed lines each never
+    reached the model, and the posted comment listed only the files the budget
+    cut. Each one now gets its diff from git, which is redacted and read like any
+    other patch. A file git cannot diff either comes back in the list, and the
+    review names it and fails the check (left_out_note).
+
+    The files API also stops at FILES_API_LIMIT files, and a file past it never
+    reached the review or the note. The number it listed is now held against
+    the PR's `changed_files`, and a gap fails the check the same way. A list
+    that reaches the limit fails whatever the count says (listing_gap).
+    """
     pr_number = os.getenv("PR_NUMBER") or ""
     repo = os.getenv("GITHUB_REPOSITORY") or ""
     token = os.getenv("GH_TOKEN") or ""
     if not pr_number or not repo:
-        return ""
+        return "", [], ("", "")
 
+    # PR_NUMBER goes into both API paths below as it comes; the workflow sets it
+    # from the event. The host is fixed and the token reaches this repository
+    # only. A bad number fails the review: the count comes back None (partial),
+    # and a files response that is not a file list raises. The refspec in
+    # fetch_pr_head() names a ref git writes, so it is checked there.
+    changed = pr_changed_files(repo, pr_number, token)
     patches = []
+    unfetched = []
+    listed = 0  # Every file the API sent, the excluded ones too: changed_files counts them.
+    fetched = None  # fetch_pr_head() runs once, and only for a file that needs it.
     page = 1
     while True:
-        request = urllib.request.Request(
-            f"https://api.github.com/repos/{repo}/pulls/{pr_number}/files?per_page=100&page={page}",
-            headers={
-                "accept": "application/vnd.github+json",
-                "authorization": f"Bearer {token}",
-                "x-github-api-version": "2022-11-28",
-            },
-        )
-        with urllib.request.urlopen(request, timeout=30) as response:
-            files = json.loads(response.read().decode("utf-8"))
+        files = github_get(f"repos/{repo}/pulls/{pr_number}/files?per_page=100&page={page}", token)
         if not files:
             break
+        listed += len(files)
         for file_info in files:
             filename = file_info.get("filename", "")
+            if not filename or not include_file(filename):
+                continue
             patch = file_info.get("patch", "")
-            if filename and patch and include_file(filename):
+            if patch:
                 patches.append(f"diff --git a/{filename} b/{filename}\n{patch}")
+                continue
+            if fetched is None:
+                fetched = fetch_pr_head(pr_number)
+            diff = git_file_diff(file_info) if fetched else ""
+            if diff.strip():
+                patches.append(diff.rstrip("\n"))
+            else:
+                unfetched.append(filename)
         page += 1
-    return "\n".join(patches)
+    return "\n".join(patches), unfetched, listing_gap(listed, changed)
 
 
 _FILE_HEADER = re.compile(r"^diff --git a/.* b/(.*)$", re.M)
@@ -1118,47 +1548,122 @@ def _name_list(paths: list[str], limit: int = 40) -> str:
     return names + (f", and {more} more" if more > 0 else "")
 
 
-def cap_diff(diff: str) -> tuple[str, str]:
-    """Fit a diff into the review budget and say what did not fit.
+_HUNK_HEADER = re.compile(r"^@@", re.M)
 
-    Returns the text the model reads and a note for the reader, empty when
-    nothing was cut. The cut lands on a line boundary, so no line reaches the
-    model half-written, and the marker goes INSIDE the text the model reads:
-    without it the tail of a cut file looks like the author's broken code.
+
+def _file_sections(diff: str) -> list[str]:
+    """The diff cut at each file header. Joined back, the sections are the diff."""
+    starts = [header.start() for header in _FILE_HEADER.finditer(diff)]
+    if not starts or starts[0] != 0:
+        starts.insert(0, 0)
+    ends = starts[1:] + [len(diff)]
+    return [diff[start:end] for start, end in zip(starts, ends) if end > start]
+
+
+def chunk_diff(diff: str, size: int) -> list[str]:
+    """The whole diff in chunks of at most `size` characters, in diff order.
+
+    Files are packed whole, and a file that fits in a chunk is never split. A
+    file longer than any chunk is cut between hunks, filling what is left of
+    the current chunk first, and each piece after the first repeats the file's
+    header lines so the model always knows which file it is reading. A hunk
+    longer than `size` goes over, in a chunk of its own: half a hunk reads as
+    code the author never wrote. No character of the diff is left out.
     """
-    budget = review_budget()
-    if len(diff) <= budget:
-        return diff, ""
-    # rfind is -1 when the first `budget` characters hold no newline at all;
-    # then the only cut left is the character count.
-    kept = diff.rfind("\n", 0, budget) + 1 or budget
-    headers = list(_FILE_HEADER.finditer(diff))
-    ends = [header.start() for header in headers[1:]] + [len(diff)]
-    cut_partway = [
-        h.group(1).strip() for h, end in zip(headers, ends) if h.start() < kept < end
-    ]
-    unreviewed = [h.group(1).strip() for h in headers if h.start() >= kept]
-    parts = [f"{kept:,} of {len(diff):,} characters of this diff were reviewed."]
-    if cut_partway:
-        parts.append(f"Cut partway: {_name_list(cut_partway)}.")
-    if unreviewed:
-        parts.append(f"Not reviewed at all: {_name_list(unreviewed)}.")
-    note = " ".join(parts)
-    marker = f"\n--- DIFF CUT HERE BY THE REVIEW TOOL, NOT BY THE AUTHOR. {note} ---\n"
-    return diff[:kept] + marker, note
+    chunks = []
+    current = ""
+    for section in _file_sections(diff):
+        if len(current) + len(section) <= size:
+            current += section
+            continue
+        starts = [hunk.start() for hunk in _HUNK_HEADER.finditer(section)]
+        if len(section) <= size or not starts:
+            # It fits a chunk of its own, or has no hunk to cut at: it goes whole.
+            if current:
+                chunks.append(current)
+            current = section
+            continue
+        header = section[: starts[0]]
+        piece = header
+        for start, end in zip(starts, starts[1:] + [len(section)]):
+            hunk = section[start:end]
+            if len(current) + len(piece) + len(hunk) > size:
+                if piece != header:
+                    chunks.append(current + piece)
+                    current, piece = "", header
+                elif current:
+                    chunks.append(current)
+                    current = ""
+            piece += hunk
+        current += piece
+    if current:
+        chunks.append(current)
+    return chunks
 
 
-def review_diff(base: str, head: str) -> tuple[str, str]:
-    """The redacted diff to review, capped, and the note naming what the cap left out."""
-    diff = pr_diff()
-    if not diff:
-        pathspecs = [*ALLOW_PATTERNS, *[f":!{pattern}" for pattern in EXCLUDE_PATTERNS]]
+class ReviewPlan(NamedTuple):
+    """What the model reads, in parts, and what that covers."""
+
+    chunks: list[str]
+    files: list[str]
+    unfetched: list[str]
+    chars: int
+    # listing_gap(): what the files API never listed, and what to do about it.
+    unlisted: str = ""
+    unlisted_fix: str = ""
+
+
+def review_plan(base: str, head: str) -> ReviewPlan:
+    """The redacted diff in chunks of review_budget() characters, and its coverage.
+
+    `files` are the changed files whose diff is in the chunks. `unfetched` are
+    the files pr_diff() could not get a diff for, and `unlisted` says how many
+    the files API never listed; the review names both and fails (left_out_note).
+    """
+    diff, unfetched, (unlisted, unlisted_fix) = pr_diff()
+    if not diff and not unfetched and not unlisted:
+        # The long form. Git reads the character after a short `:!` as more
+        # magic, so a pattern that starts with `_` or another symbol stops the
+        # whole diff: the kit's own reviewer failed on `:!__pycache__/*` with
+        # "Unimplemented pathspec magic '_'" (kit #323). `:(exclude)` takes any
+        # pattern as written and selects the same files.
+        pathspecs = [*ALLOW_PATTERNS, *[f":(exclude){pattern}" for pattern in EXCLUDE_PATTERNS]]
         diff = run_git(["diff", "--unified=80", base, head, "--", *pathspecs])
-    return cap_diff(redact(diff))
+    diff = redact(diff)
+    files = list(dict.fromkeys(h.group(1).strip() for h in _FILE_HEADER.finditer(diff)))
+    return ReviewPlan(
+        chunk_diff(diff, review_budget()), files, unfetched, len(diff), unlisted, unlisted_fix
+    )
 
 
-def diff_text(base: str, head: str) -> str:
-    return review_diff(base, head)[0]
+def _unfetched_sentence(unfetched: list[str]) -> str:
+    return (
+        "Not reviewed at all, because GitHub sent no patch and git could not"
+        f" produce one: {_name_list(unfetched)}."
+    )
+
+
+def _left_out_marker(plan: ReviewPlan) -> str:
+    """The line the model reads about what the tool left out: the facts, no advice."""
+    facts = [_unfetched_sentence(plan.unfetched)] if plan.unfetched else []
+    if plan.unlisted:
+        facts.append(plan.unlisted)
+    if not facts:
+        return ""
+    return f"--- LEFT OUT BY THE REVIEW TOOL, NOT BY THE AUTHOR. {' '.join(facts)} ---"
+
+
+def left_out_note(plan: ReviewPlan) -> str:
+    """The note for the PR comment naming every file the review did not read."""
+    notes = []
+    if plan.unfetched:
+        notes.append(
+            f"{_unfetched_sentence(plan.unfetched)} The job log says why; re-run once"
+            " that is fixed."
+        )
+    if plan.unlisted:
+        notes.append(f"{plan.unlisted} {plan.unlisted_fix}")
+    return " ".join(notes)
 
 
 def codebase_snapshot() -> str:
@@ -1230,15 +1735,24 @@ FAILED_BANNER = "**The review did not run.**"
 # review called the cut "truncated mid-string" and asked whether it was a syntax
 # error, and never mentioned the files after it.
 #
-# A cut review is named AND failed. It was named and passed with a warning at
-# first (kit #284), on the argument that a known gap is not an unknown one. The
-# review of the rollout (capaz#14) showed why that was wrong: the author decides
-# what comes first in a diff, so padding the head pushes the change that matters
-# past the cut and the check still passes. The unreviewed files are listed so
-# the author knows what to split out; a repo whose PRs are routinely larger
-# raises CLAUDE_REVIEW_MAX_CHARS (review_budget) rather than editing this file.
+# A cut review was then named AND failed (kit #284, #292): the author decides
+# what comes first in a diff, so padding the head pushed the change that
+# mattered past the cut while the check passed (capaz#14). Failing named the
+# gap but read no more of the diff: on capaz#57, 1,124,890 characters, the
+# review read 120,000 and listed the rest. Now nothing is cut. A diff past
+# review_budget() is read whole, in parts (chunk_diff, review_in_parts), and
+# what limits a review is its estimated cost (STATUS_OVER_BUDGET).
+#
+# What can still leave a file unread is a file with no diff to send: GitHub
+# sent no patch and git could not produce one (pr_diff). That is `partial`,
+# and the gate fails it; the note after the banner names each file.
 STATUS_PARTIAL = "partial"
-PARTIAL_BANNER = "> **Partial: this diff was larger than the review budget.**"
+PARTIAL_BANNER = "> **Partial: part of this diff was not reviewed.**"
+# A review whose estimated cost is over CLAUDE_REVIEW_MAX_USD does not run, and
+# the gate fails it. The body says how large the diff is and what it would
+# cost, and the operator decides: raise the cap for this repo, or split the PR.
+STATUS_OVER_BUDGET = "over-budget"
+OVER_BUDGET_BANNER = "**The review did not run: its estimated cost is over the cap.**"
 
 
 def write_status(status: str) -> None:
@@ -1268,6 +1782,8 @@ def review_status(text: str) -> str:
     # is what may excuse it.
     if text.startswith(NO_KEY_BANNER):
         return STATUS_NO_KEY
+    if text.startswith(OVER_BUDGET_BANNER):
+        return STATUS_OVER_BUDGET
     if text.startswith(PARTIAL_BANNER):
         return STATUS_PARTIAL
     return STATUS_OK
@@ -1311,25 +1827,36 @@ def max_tokens_from_env() -> int:
     a mistyped repository variable unnoticed for as long as nobody reads the
     job log closely.
     """
-    return _positive_int_from_env("CLAUDE_REVIEW_MAX_TOKENS", DEFAULT_CLAUDE_REVIEW_MAX_TOKENS)
+    return _positive_from_env("CLAUDE_REVIEW_MAX_TOKENS", DEFAULT_CLAUDE_REVIEW_MAX_TOKENS)
 
 
 def review_budget() -> int:
-    """Characters of diff the model reads: CLAUDE_REVIEW_MAX_CHARS, or MAX_REVIEW_CHARS.
+    """Characters of diff in one model call: CLAUDE_REVIEW_MAX_CHARS, or MAX_REVIEW_CHARS.
 
-    A diff past this fails the check (see STATUS_PARTIAL), so a repo whose PRs
-    are routinely larger raises it with a repository variable instead of
-    editing a vendored file. Same parsing as max_tokens_from_env.
+    A diff within it is one call, as it always was. A longer one used to be cut
+    here and failed; now it is read in parts of this size (chunk_diff), so a repo
+    that raised the variable gets fewer, larger parts and nothing else changes.
+    The full-codebase snapshot still stops at it. Same parsing as
+    max_tokens_from_env.
     """
-    return _positive_int_from_env("CLAUDE_REVIEW_MAX_CHARS", MAX_REVIEW_CHARS)
+    return _positive_from_env("CLAUDE_REVIEW_MAX_CHARS", MAX_REVIEW_CHARS)
 
 
-def _positive_int_from_env(name: str, default: int) -> int:
+def review_cap_usd() -> float:
+    """What one review may cost: CLAUDE_REVIEW_MAX_USD, or DEFAULT_MAX_REVIEW_USD.
+
+    Checked against estimate_cost_usd() before the first call. Same parsing as
+    max_tokens_from_env, with a decimal allowed.
+    """
+    return _positive_from_env("CLAUDE_REVIEW_MAX_USD", DEFAULT_MAX_REVIEW_USD, float)
+
+
+def _positive_from_env(name: str, default, parse=int):
     raw = os.getenv(name, "").strip()
     if not raw:
         return default
     try:
-        value = int(raw)
+        value = parse(raw)
     except ValueError:
         value = 0
     # Zero and negatives are typos too: the API would reject them and the
@@ -1338,42 +1865,68 @@ def _positive_int_from_env(name: str, default: int) -> int:
     if value > 0:
         return value
     print(
-        f"::warning::{name}={raw!r} is not a positive integer; "
+        f"::warning::{name}={raw!r} is not a positive number; "
         f"using the script default {default}.",
         file=sys.stderr,
     )
     return default
 
 
+def _prices() -> tuple[float, float, float, float]:
+    """Input and output USD per million tokens, then the cache write and read multipliers."""
+    return (
+        price_env(
+            "CLAUDE_REVIEW_INPUT_PRICE_USD_PER_MILLION", DEFAULT_INPUT_PRICE_USD_PER_MILLION
+        ),
+        price_env(
+            "CLAUDE_REVIEW_OUTPUT_PRICE_USD_PER_MILLION", DEFAULT_OUTPUT_PRICE_USD_PER_MILLION
+        ),
+        price_env(
+            "CLAUDE_REVIEW_CACHE_CREATION_INPUT_PRICE_MULTIPLIER",
+            DEFAULT_CACHE_CREATION_INPUT_PRICE_MULTIPLIER,
+        ),
+        price_env(
+            "CLAUDE_REVIEW_CACHE_READ_INPUT_PRICE_MULTIPLIER",
+            DEFAULT_CACHE_READ_INPUT_PRICE_MULTIPLIER,
+        ),
+    )
+
+
+_USAGE_KEYS = (
+    "input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
+)
+
+
+def _tokens(usage: dict | None, key: str) -> int:
+    return int((usage or {}).get(key, 0) or 0)
+
+
+def add_usage(total: dict[str, int], usage: dict | None) -> dict[str, int]:
+    """Sum the billed token counts of one more call into `total`."""
+    return {key: _tokens(total, key) + _tokens(usage, key) for key in _USAGE_KEYS}
+
+
+def usage_cost(usage: dict | None) -> float:
+    # Per Anthropic's response schema, input_tokens is non-cached input;
+    # cache creation and cache read tokens are billed separately.
+    input_price, output_price, creation_multiplier, read_multiplier = _prices()
+    return (
+        (_tokens(usage, "input_tokens") * input_price)
+        + (_tokens(usage, "cache_creation_input_tokens") * input_price * creation_multiplier)
+        + (_tokens(usage, "cache_read_input_tokens") * input_price * read_multiplier)
+        + (_tokens(usage, "output_tokens") * output_price)
+    ) / 1_000_000
+
+
 def usage_summary(model: str, usage: dict[str, int] | None) -> str:
     if not usage:
         return ""
-    # Per Anthropic's response schema, input_tokens is non-cached input;
-    # cache creation and cache read tokens are billed separately.
-    input_tokens = int(usage.get("input_tokens", 0) or 0)
-    output_tokens = int(usage.get("output_tokens", 0) or 0)
-    cache_creation_tokens = int(usage.get("cache_creation_input_tokens", 0) or 0)
-    cache_read_tokens = int(usage.get("cache_read_input_tokens", 0) or 0)
-    input_price = price_env(
-        "CLAUDE_REVIEW_INPUT_PRICE_USD_PER_MILLION", DEFAULT_INPUT_PRICE_USD_PER_MILLION
-    )
-    output_price = price_env(
-        "CLAUDE_REVIEW_OUTPUT_PRICE_USD_PER_MILLION", DEFAULT_OUTPUT_PRICE_USD_PER_MILLION
-    )
-    cache_creation_multiplier = price_env(
-        "CLAUDE_REVIEW_CACHE_CREATION_INPUT_PRICE_MULTIPLIER",
-        DEFAULT_CACHE_CREATION_INPUT_PRICE_MULTIPLIER,
-    )
-    cache_read_multiplier = price_env(
-        "CLAUDE_REVIEW_CACHE_READ_INPUT_PRICE_MULTIPLIER",
-        DEFAULT_CACHE_READ_INPUT_PRICE_MULTIPLIER,
-    )
-    estimated_cost = (
-        (input_tokens * input_price)
-        + (cache_creation_tokens * input_price * cache_creation_multiplier)
-        + (cache_read_tokens * input_price * cache_read_multiplier)
-        + (output_tokens * output_price)
-    ) / 1_000_000
+    input_tokens = _tokens(usage, "input_tokens")
+    output_tokens = _tokens(usage, "output_tokens")
+    cache_creation_tokens = _tokens(usage, "cache_creation_input_tokens")
+    cache_read_tokens = _tokens(usage, "cache_read_input_tokens")
+    input_price, output_price, cache_creation_multiplier, cache_read_multiplier = _prices()
+    estimated_cost = usage_cost(usage)
     lines = [
         "## Claude Review Usage", "",
         f"- Model: `{model}`",
@@ -1547,6 +2100,10 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 # changed -- proxies, cookies and TLS verification all behave as before.
 _NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
 
+# The GitHub token gets the same refusal (github_get). It has an opener of its
+# own so that a test faking the model on the one above leaves GitHub's alone.
+_GITHUB_OPENER = urllib.request.build_opener(_NoRedirect)
+
 
 def is_upstream_credit_exhausted(detail: str | None) -> bool:
     """Did the PROVIDER refuse for lack of credit, behind the broker's status?
@@ -1571,36 +2128,56 @@ def is_upstream_credit_exhausted(detail: str | None) -> bool:
     return "credit balance" in lowered or "insufficient credit" in lowered
 
 
+REVIEW_FOCUS = (
+    "Focus on correctness, security, secret handling, deployment risk, tests, "
+    "input validation, error handling, and maintainability. Use any CONTRIBUTING, "
+    "AGENTS.md, or docs/standards guidance present in the repo. Do not ask for or "
+    "reveal secrets; if a value appears redacted, treat that as intentional. "
+    "Prioritize concrete, specific findings over generic advice."
+)
+
+
+def _project() -> str:
+    return (os.getenv("REVIEW_PROJECT_NAME") or "this repository").strip()
+
+
+def _model() -> str:
+    return os.getenv("CLAUDE_REVIEW_MODEL", DEFAULT_CLAUDE_REVIEW_MODEL)
+
+
+def _no_key_body() -> str:
+    # Built from NO_KEY_BANNER rather than repeating the string, so the
+    # producer and the classifier cannot drift apart -- the whole defect was
+    # a body no classifier case matched.
+    return f"## Claude Code Review\n\n{NO_KEY_BANNER}"
+
+
 def call_claude(review_text: str, review_scope: str = "diff") -> str:
+    return review_once(review_text, review_scope)[0]
+
+
+def review_once(review_text: str, review_scope: str = "diff") -> tuple[str, dict]:
+    """Review `review_text` in one call: the comment body, and the tokens it billed."""
     key = os.getenv("ANTHROPIC_API_KEY")
     if not key:
-        # Built from NO_KEY_BANNER rather than repeating the string, so the
-        # producer and the classifier cannot drift apart -- the whole defect was
-        # a body no classifier case matched.
-        return f"## Claude Code Review\n\n{NO_KEY_BANNER}"
+        return _no_key_body(), {}
 
-    project = (os.getenv("REVIEW_PROJECT_NAME") or "this repository").strip()
-    common = (
-        "Focus on correctness, security, secret handling, deployment risk, tests, "
-        "input validation, error handling, and maintainability. Use any CONTRIBUTING, "
-        "AGENTS.md, or docs/standards guidance present in the repo. Do not ask for or "
-        "reveal secrets; if a value appears redacted, treat that as intentional. "
-        "Prioritize concrete, specific findings over generic advice."
-    )
+    project = _project()
     if review_scope == "full":
         instructions = (
             f"You are reviewing a production-bound full codebase snapshot for {project}. "
-            "The snapshot is size-limited and begins with a file-order manifest. " + common
+            "The snapshot is size-limited and begins with a file-order manifest. "
+            + REVIEW_FOCUS
         )
         review_block = f"Codebase snapshot:\n```text\n{review_text}\n```"
     else:
         instructions = (
             f"You are reviewing a production-bound pull-request diff for {project}. "
-            + common
+            + REVIEW_FOCUS
             + " Be concise."
         )
         review_block = f"Diff:\n```diff\n{review_text}\n```"
-    model = os.getenv("CLAUDE_REVIEW_MODEL", DEFAULT_CLAUDE_REVIEW_MODEL)
+    model = _model()
     max_tokens = max_tokens_from_env()
     payload = {
         # 2048 was cutting it close enough to matter: an observed review used
@@ -1610,16 +2187,38 @@ def call_claude(review_text: str, review_scope: str = "diff") -> str:
         # not by the ceiling.
         "model": model,
         "max_tokens": max_tokens,
+        # No cache_control. A cache write bills input at 1.25x and pays off
+        # only when a later request reads it, and this is the only request.
+        # The marker that sat on review_block bought nothing: 36 posted reviews
+        # across capaz and the kit each show every input token as a cache
+        # write and a cache read of 0.
         "messages": [
             {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": instructions},
-                    {"type": "text", "text": review_block, "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": review_block},
                 ],
             }
         ],
     }
+    result = post_review(payload, key)
+    if isinstance(result, str):
+        return f"## Claude Code Review\n\n{result}", {}
+    text = review_text_from_body(result)
+    parts = ["## Claude Code Review\n\n" + text]
+    usage = usage_summary(model, result.get("usage"))
+    if usage:
+        parts.append(usage)
+    return "\n\n".join(parts), add_usage({}, result.get("usage"))
+
+
+def post_review(payload: dict, key: str) -> dict | str:
+    """Send one Messages request: the parsed body, or why there is none.
+
+    The reason is what a review comment carries under its header. It starts with
+    FAILED_BANNER, so review_status() reads it as `failed`.
+    """
     request = urllib.request.Request(
         messages_endpoint(),
         data=json.dumps(payload).encode("utf-8"),
@@ -1691,7 +2290,7 @@ def call_claude(review_text: str, review_scope: str = "diff") -> str:
                 " Add credit to the provider account."
             )
         return (
-            f"## Claude Code Review\n\n{FAILED_BANNER} HTTP {exc.code} from the API,"
+            f"{FAILED_BANNER} HTTP {exc.code} from the API,"
             f" so nothing in this diff was reviewed.{hint}"
             f"\n\n```text\n{detail}\n```"
         )
@@ -1748,7 +2347,7 @@ def call_claude(review_text: str, review_scope: str = "diff") -> str:
                 f" is the first thing to try; if it repeats, the detail below"
                 f" is the thing to look at."
             )
-        return f"## Claude Code Review\n\n{FAILED_BANNER}{what}\n\n```text\n{exc}\n```"
+        return f"{FAILED_BANNER}{what}\n\n```text\n{exc}\n```"
     except OSError as exc:
         # A NETWORK FAILURE THAT IS NOT AN HTTP ERROR STILL HAS TO POST.
         #
@@ -1776,7 +2375,7 @@ def call_claude(review_text: str, review_scope: str = "diff") -> str:
         # first -- it is more specific and carries the status code this one
         # cannot.
         return (
-            f"## Claude Code Review\n\n{FAILED_BANNER} The API call did not"
+            f"{FAILED_BANNER} The API call did not"
             f" complete ({type(exc).__name__}), so nothing in this diff was"
             f" reviewed. This is a transport failure rather than a rejection:"
             f" there is no status code because no response arrived. A re-run is"
@@ -1805,58 +2404,265 @@ def call_claude(review_text: str, review_scope: str = "diff") -> str:
     except ValueError as exc:
         detail = raw.decode("utf-8", errors="replace")[:1000]
         return (
-            f"## Claude Code Review\n\n{FAILED_BANNER} The endpoint answered,"
+            f"{FAILED_BANNER} The endpoint answered,"
             f" but the body did not parse as JSON ({type(exc).__name__}), so"
             f" nothing in this diff was reviewed. A proxy error page or a"
             f" truncated response reads like this; the first 1000 characters"
             f" are below.\n\n```text\n{detail}\n```"
         )
-
-    text = review_text_from_body(body)
-
-    parts = ["## Claude Code Review\n\n" + text]
-    usage = usage_summary(model, body.get("usage"))
-    if usage:
-        parts.append(usage)
-    return "\n\n".join(parts)
+    return body
 
 
 def mark_partial(body: str, note: str) -> str:
-    """Put the cut at the top of a finished review, where it is read first."""
-    banner = (
-        f"{PARTIAL_BANNER} {note} Split the PR, or raise the CLAUDE_REVIEW_MAX_CHARS"
-        f" repository variable (now {review_budget():,}), and re-run.\n\n"
-    )
+    """Put what the review left out at the top of the body, where it is read first."""
+    banner = f"{PARTIAL_BANNER} {note}\n\n"
     head, header, rest = body.partition("## Claude Code Review\n\n")
     if not header:
         return banner + body
     return head + header + banner + rest
 
 
-def main() -> int:
-    review_scope = os.getenv("REVIEW_SCOPE", "diff").strip().lower()
-    cut_note = ""
-    if review_scope == "full":
-        review_text = codebase_snapshot()
-    else:
-        base, head = base_head()
-        review_text, cut_note = review_diff(base, head)
-    if not review_text.strip():
-        write_review("## Claude Code Review\n\nSkipped: no reviewable diff.")
-        write_status(STATUS_SKIPPED)
-        return 0
+def _parts_context(plan: ReviewPlan) -> str:
+    """The block every call of a review in parts opens with, the same bytes each time.
 
-    body = call_claude(review_text, review_scope=review_scope)
-    # Only a FINISHED review is marked partial. A failed, empty or truncated one
-    # is already red, and a banner in front of it would hide that from
-    # status_for, which reads the opening line.
-    if cut_note and status_for(body) == STATUS_OK:
-        body = mark_partial(body, cut_note)
+    It names no part. A prompt cache matches a prefix exactly, and the first byte
+    that differs between two calls ends what the second can read.
+    """
+    lines = [
+        f"You are reviewing a production-bound pull-request diff for {_project()}. "
+        + REVIEW_FOCUS,
+        "",
+        f"The diff is {plan.chars:,} characters, more than one reading holds, so it is"
+        f" split into {len(plan.chunks)} parts at file and hunk boundaries. Each part"
+        " is reviewed on its own, and the part reviews are then merged into one. A"
+        " file longer than a part continues in the next one, under its header again.",
+        "",
+        "Every changed file in this pull request:",
+        *(f"- {name}" for name in plan.files),
+    ]
+    marker = _left_out_marker(plan)
+    if marker:
+        lines += ["", marker]
+    return "\n".join(lines)
+
+
+def _part_task(number: int, total: int, chunk: str) -> str:
+    return (
+        f"Review part {number} of {total}. Report what this part shows; each other"
+        " part has a reviewer of its own. Be concise.\n\n"
+        f"Diff, part {number} of {total}:\n```diff\n{chunk}\n```"
+    )
+
+
+MERGE_TASK = (
+    "Every part of this diff has been reviewed, and the part reviews follow. Write"
+    " the review of the whole pull request from them. Keep every distinct finding"
+    " with its file and line, merge findings that describe one problem into one,"
+    " put the most severe first, and add nothing the part reviews do not support."
+    " Be concise."
+)
+
+# The banner a review in parts leads with when a part did not finish: the most
+# severe outcome among the parts, so the gate fails it for that reason.
+_UNFINISHED_BANNERS = {
+    STATUS_FAILED: FAILED_BANNER,
+    STATUS_EMPTY: EMPTY_BANNER,
+    STATUS_TRUNCATED: TRUNCATED_BANNER,
+}
+
+
+def review_in_parts(plan: ReviewPlan) -> tuple[str, dict]:
+    """Review each chunk in its own call, then merge the part reviews in one more.
+
+    Every call opens with the same context block (_parts_context), marked for
+    the prompt cache, so after the first call it bills at the cache-read price.
+    A cache entry is readable only once the response that writes it has begun,
+    so part 1 runs alone and the rest run REVIEW_WORKERS at a time. Below the
+    model's minimum cacheable length (1,024 tokens on claude-sonnet-5) the
+    marker writes nothing and costs nothing.
+
+    The parts are merged only when every part review finished. Otherwise the
+    body leads with the most severe part's banner and posts every part's
+    outcome, so the parts already paid for are read, not thrown away.
+    """
+    key = os.getenv("ANTHROPIC_API_KEY")
+    if not key:
+        return _no_key_body(), {}
+    model = _model()
+    max_tokens = max_tokens_from_env()
+    context = {
+        "type": "text", "text": _parts_context(plan), "cache_control": {"type": "ephemeral"},
+    }
+
+    def call(task: str) -> dict | str:
+        return post_review({
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": [context, {"type": "text", "text": task}]}],
+        }, key)
+
+    total = len(plan.chunks)
+    tasks = [_part_task(number, total, chunk) for number, chunk in enumerate(plan.chunks, 1)]
+    results = [call(tasks[0])]
+    with ThreadPoolExecutor(max_workers=REVIEW_WORKERS) as pool:
+        results += pool.map(call, tasks[1:])
+
+    usage: dict[str, int] = {}
+    texts = []
+    for result in results:
+        if isinstance(result, str):
+            texts.append(result)
+        else:
+            texts.append(review_text_from_body(result))
+            usage = add_usage(usage, result.get("usage"))
+    sections = "\n\n".join(
+        f"### Part {number} of {total}\n\n{text}" for number, text in enumerate(texts, 1)
+    )
+    statuses = [review_status(text) for text in texts]
+    unfinished = [number for number, status in enumerate(statuses, 1) if status != STATUS_OK]
+    calls = len(results)
+    if unfinished:
+        worst = next((s for s in _UNFINISHED_BANNERS if s in statuses), STATUS_FAILED)
+        body = (
+            f"## Claude Code Review\n\n{_UNFINISHED_BANNERS[worst]} Part"
+            f" {', '.join(map(str, unfinished))} of {total} did not finish, so the parts"
+            f" were not merged. Each part's outcome is below.\n\n{sections}"
+        )
+    else:
+        merged = call(f"{MERGE_TASK}\n\n{sections}")
+        calls += 1
+        if isinstance(merged, str):
+            text = merged
+        else:
+            text = review_text_from_body(merged)
+            usage = add_usage(usage, merged.get("usage"))
+        body = f"## Claude Code Review\n\n{text}"
+        if review_status(text) != STATUS_OK:
+            body += f"\n\nThe part reviews, unmerged:\n\n{sections}"
+    summary = usage_summary(model, usage)
+    if summary:
+        body += f"\n\n{summary}\n- Calls: `{calls}`"
+    return body, usage
+
+
+def estimate_cost_usd(plan: ReviewPlan) -> float:
+    """What reviewing `plan` should cost, before any call is made.
+
+    Input counts CHARS_PER_TOKEN characters a token: the diff, the context block
+    each call of a review in parts repeats, and the merge call reading
+    OUTPUT_TOKENS_PER_CALL for each part. Output counts OUTPUT_TOKENS_PER_CALL a
+    call. The cache discount is left out, so input errs high. Every call
+    spending all of CLAUDE_REVIEW_MAX_TOKENS would cost more; the cap is checked
+    against this estimate, and the comment reports what was actually spent.
+    """
+    parts = len(plan.chunks)
+    calls = parts + 1 if parts > 1 else parts
+    input_chars = plan.chars + (len(_parts_context(plan)) * calls if parts > 1 else 0)
+    input_tokens = input_chars / CHARS_PER_TOKEN
+    if parts > 1:
+        input_tokens += parts * OUTPUT_TOKENS_PER_CALL
+    input_price, output_price, _, _ = _prices()
+    output_tokens = calls * OUTPUT_TOKENS_PER_CALL
+    return (input_tokens * input_price + output_tokens * output_price) / 1_000_000
+
+
+def coverage_section(plan: ReviewPlan, estimate: float, cap: float, spent: float | None) -> str:
+    """How much of the PR the review read and what it cost, posted on every diff review."""
+    reviewed = len(plan.files)
+    parts = len(plan.chunks)
+    lines = [
+        "## Claude Review Coverage", "",
+        f"- Files: {reviewed} of {reviewed + len(plan.unfetched)} reviewable changed files"
+        + (" GitHub listed. It did not list them all." if plan.unlisted else "."),
+        f"- Diff: {plan.chars:,} characters in {parts} part{'s' if parts != 1 else ''} of"
+        f" at most {review_budget():,} (CLAUDE_REVIEW_MAX_CHARS).",
+        f"- Estimated before the run: ${estimate:.2f}, at {CHARS_PER_TOKEN} characters a"
+        f" token and {OUTPUT_TOKENS_PER_CALL:,} output tokens a call. Cap: ${cap:.2f}"
+        " (CLAUDE_REVIEW_MAX_USD).",
+    ]
+    if spent is not None:
+        lines.append(f"- Spent: ${spent:.2f}, from the usage the API reported.")
+    return "\n".join(lines)
+
+
+def _finish(body: str) -> int:
     write_review(body)
     # The status is read from the REVIEW TEXT, which is the part
     # review_text_from_body already classified, not from the wrapper.
     write_status(status_for(body))
     return 0
+
+
+def main() -> int:
+    review_scope = os.getenv("REVIEW_SCOPE", "diff").strip().lower()
+    if review_scope == "full":
+        review_text = codebase_snapshot()
+        if not review_text.strip():
+            write_review("## Claude Code Review\n\nSkipped: no reviewable diff.")
+            write_status(STATUS_SKIPPED)
+            return 0
+        if not os.getenv("ANTHROPIC_API_KEY"):
+            return _finish(_no_key_body())
+        # The snapshot is one call, so it is priced as a diff in one part.
+        estimate = estimate_cost_usd(ReviewPlan([review_text], [], [], len(review_text)))
+        cap = review_cap_usd()
+        if estimate > cap:
+            return _finish(
+                f"## Claude Code Review\n\n{OVER_BUDGET_BANNER} The codebase snapshot is"
+                f" {len(review_text):,} characters, one call at an estimated"
+                f" ${estimate:.2f} ({CHARS_PER_TOKEN} characters a token and"
+                f" {OUTPUT_TOKENS_PER_CALL:,} output tokens), over the ${cap:.2f} cap."
+                " Nothing was sent to the model. The operator decides: raise the"
+                " CLAUDE_REVIEW_MAX_USD repository variable and re-run, or lower"
+                " CLAUDE_REVIEW_MAX_CHARS, which sizes the snapshot."
+            )
+        return _finish(call_claude(review_text, review_scope=review_scope))
+
+    base, head = base_head()
+    plan = review_plan(base, head)
+    left_out = left_out_note(plan)
+    if not "".join(plan.chunks).strip():
+        # Every reviewable file was left out, which is a gap, not an empty PR.
+        if left_out:
+            return _finish(mark_partial(
+                "## Claude Code Review\n\nNo file in this PR had a diff the"
+                " reviewer could send, so the model was not called.",
+                left_out,
+            ))
+        write_review("## Claude Code Review\n\nSkipped: no reviewable diff.")
+        write_status(STATUS_SKIPPED)
+        return 0
+    # No key is checked before the cost: it is its own status, and the gate
+    # excuses it for Dependabot alone.
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        return _finish(_no_key_body())
+
+    estimate, cap = estimate_cost_usd(plan), review_cap_usd()
+    if estimate > cap:
+        return _finish(
+            f"## Claude Code Review\n\n{OVER_BUDGET_BANNER} This diff is"
+            f" {plan.chars:,} characters across {len(plan.files)} files, which is"
+            f" {len(plan.chunks)} parts to review at an estimated ${estimate:.2f},"
+            f" over the ${cap:.2f} cap. Nothing was sent to the model. The operator"
+            " decides: raise the CLAUDE_REVIEW_MAX_USD repository variable and re-run,"
+            f" or split the PR.{' ' + left_out if left_out else ''}\n\n"
+            + coverage_section(plan, estimate, cap, None)
+        )
+
+    if len(plan.chunks) == 1:
+        text = plan.chunks[0]
+        marker = _left_out_marker(plan)
+        if marker:
+            text += f"\n{marker}\n"
+        body, usage = review_once(text)
+    else:
+        body, usage = review_in_parts(plan)
+    # Only a FINISHED review is marked partial. A failed, empty or truncated one
+    # is already red, and a banner in front of it would hide that from
+    # status_for, which reads the opening line.
+    if left_out and status_for(body) == STATUS_OK:
+        body = mark_partial(body, left_out)
+    return _finish(f"{body}\n\n{coverage_section(plan, estimate, cap, usage_cost(usage))}")
 
 
 if __name__ == "__main__":
