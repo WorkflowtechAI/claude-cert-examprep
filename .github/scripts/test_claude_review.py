@@ -284,6 +284,25 @@ class FileSelectionTreatsRootLikeNested(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertFalse(claude_review.include_file(path), path)
 
+    def test_the_local_diff_excludes_with_the_long_pathspec_form(self):
+        # Without a PR the review diffs base..head with git, excluding every
+        # EXCLUDE_PATTERNS entry. In the short `:!` form git reads the next
+        # character as more magic: the kit's own reviewer stopped on
+        # `:!__pycache__/*` with "Unimplemented pathspec magic '_'" (kit #323).
+        calls = []
+
+        def run_git(args):
+            calls.append(args)
+            return ""
+
+        with mock.patch.object(
+            claude_review, "pr_diff", return_value=("", [], ("", ""))
+        ), mock.patch.object(claude_review, "run_git", side_effect=run_git):
+            claude_review.review_plan("base", "head")
+        (call,) = calls
+        excludes = [arg for arg in call if arg.startswith(":")]
+        self.assertEqual(excludes, [f":(exclude){p}" for p in claude_review.EXCLUDE_PATTERNS])
+
     def test_source_is_reviewed_at_every_depth(self):
         for path in (
             "app.py", "src/a/b/c.py", "web/src/index.tsx",
@@ -1213,6 +1232,519 @@ class RedactionSparesCode(unittest.TestCase):
                 self.assertEqual(claude_review.redact(line), want)
 
 
+class ARequiredVariableExpansionReachesTheModelWhole(unittest.TestCase):
+    """`${NAME:?message}` names a secret without holding one (capaz#21).
+
+    The bare value stopped at the first space inside the braces, so the compose
+    line below reached the model as `POSTGRES_PASSWORD:"<REDACTED>" POSTGRES_PASSWORD
+    in infra/compose/.env}`, and the reviewer reported invalid YAML and a deploy
+    blocker on a file `docker compose config` accepts. Exact output, both
+    directions: what is left as written, and what is still redacted whole.
+    """
+
+    def test_a_required_variable_expansion_is_left_exactly_as_written(self):
+        for line in (
+            # The capaz#21 line, as the diff carried it.
+            "+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD"
+            " in infra/compose/.env}",
+            'POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?required}"',
+            "POSTGRES_PASSWORD: '${POSTGRES_PASSWORD:?required}'",
+            "POSTGRES_PASSWORD: ${POSTGRES_PASSWORD?required}",
+            "POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}",
+            "POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set it} # compose refuses to start",
+            "      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}",
+            '      - "POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?set it}"',
+            "environment: { POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set it} }",
+            'export DB_PASSWORD="${DB_PASSWORD:?missing}"',
+            "POSTGRES_PASSWORD:\n  ${POSTGRES_PASSWORD:?set it}",
+            # Inside a longer value the inner key is refused at `:?` instead.
+            # Split over two lines, so no line carries a credential-URL shape
+            # for the secret scan to read.
+            (
+                "DATABASE_URL: postgresql://capaz:"
+                "${POSTGRES_PASSWORD:?set it}@db:5432/capaz"
+            ),
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(line, claude_review.redact(line))
+
+    def test_an_expansion_that_can_hold_a_literal_is_redacted_whole(self):
+        whole = 'POSTGRES_PASSWORD:"<REDACTED>"'
+        cases = {
+            # #56 pinned these two: a plain reference stays a value.
+            "POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}": whole,
+            "POSTGRES_PASSWORD: $POSTGRES_PASSWORD": whole,
+            # A default or an alternate holds a literal, and the words after its
+            # first space used to reach the model: `"<REDACTED>" horse}`.
+            "POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-correct horse}": whole,
+            "POSTGRES_PASSWORD: ${POSTGRES_PASSWORD-correct horse}": whole,
+            "POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:=correct horse}": whole,
+            "POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:+correct horse}": whole,
+            # A required-variable expansion that does not END the value.
+            "POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set it}hunter2": whole,
+            'POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set it} + "hunter2"': whole,
+            # Text glued behind a closer is still the value (`_VALUE_END`).
+            "POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set it}]hunter2": whole,
+            "POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set it}}hunter2": whole,
+            # A default inside a connection URL is still the inner key's value.
+            # Split like the URL above.
+            (
+                "DATABASE_URL: postgresql://capaz:"
+                "${POSTGRES_PASSWORD:-hunter2}@db:5432/capaz"
+            ): 'DATABASE_URL: postgresql://capaz:${POSTGRES_PASSWORD:"<REDACTED>"',
+        }
+        for line, want in cases.items():
+            with self.subTest(line=line):
+                self.assertEqual(want, claude_review.redact(line))
+
+    def test_a_key_glued_behind_the_closer_is_still_redacted(self):
+        """Text glued behind the closer makes the expansion a value.
+
+        Declining it once sent these lines to a bare branch that read through
+        the glued second key, and the second value reached the model (review
+        of kit #327). The bare value now stops in front of the key, so the
+        expansion's line redacts whole and the key gets its own match.
+        """
+        for line, want in (
+            (
+                "password: ${PW:?m}]password: hunter2",
+                'password:"<REDACTED>"password:"<REDACTED>"',
+            ),
+            (
+                "DB={password: ${DB_PASSWORD:?set it}}password: hunter2",
+                'DB={password:"<REDACTED>"password:"<REDACTED>"',
+            ),
+            (
+                "password: ${PW:?m}]#password: hunter2",
+                'password:"<REDACTED>"password:"<REDACTED>"',
+            ),
+            (
+                'password: ${PW:?m}]password="hunter2"',
+                'password:"<REDACTED>"password="<REDACTED>"',
+            ),
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(want, claude_review.redact(line))
+
+    def test_the_residuals_are_pinned_not_assumed(self):
+        """What the exemption costs, asserted so HARNESS.md cannot drift.
+
+        A word typed as the MESSAGE reaches the model, and so does a value glued
+        to its colon that opens with `?` when a `}` follows on the same line,
+        since that `:?` reads as an expansion operator. A key in a vendor format
+        is still caught in the message by the prefix half.
+        """
+        message = "POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?hunter2}"
+        self.assertEqual(message, claude_review.redact(message))
+        for braced in ("{password:?hunter2}", "cfg = {password:?hunter2, user: u}"):
+            with self.subTest(braced=braced):
+                self.assertEqual(braced, claude_review.redact(braced))
+        # With no closing brace, `:?` is a separator like any other: on review
+        # of #306 these two reached the model, where main had redacted them.
+        for glued, want in (
+            ("password:?hunter2", 'password:"<REDACTED>"'),
+            ("token:?hunter2", 'token:"<REDACTED>"'),
+        ):
+            with self.subTest(glued=glued):
+                self.assertEqual(want, claude_review.redact(glued))
+        # Split, like WRITTEN_OUT_KEYS: this source line carries no key shape.
+        keyed = "POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?" + "sk-" + "abcdefghij0123456789}"
+        self.assertEqual(
+            "POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?sk-<REDACTED>}",
+            claude_review.redact(keyed),
+        )
+
+
+class ANumberUnderATokenNameReachesTheModel(unittest.TestCase):
+    """`CHARS_PER_TOKEN = 4` is a count, not a credential (kit #314).
+
+    The name rule matches `token` on its tail, so the constant reached the model
+    as `CHARS_PER_TOKEN="<REDACTED>"`, and the reviewer asked whether it was a
+    string used in arithmetic. Exact output, both directions: what is left as
+    written, and what is still redacted whole.
+
+    THESE CASES ARE REDACTED IN THE REVIEWED DIFF, AND THAT IS THE REDACTOR
+    WORKING. Each input is a `token` assignment, so the review of #317 read
+    lines such as `'token = "123456"': whole` as unbalanced quotes and as
+    duplicate keys. Both files compile and every case is distinct. Verify with
+    `git show <sha>:<path>`, not the diff.
+    """
+
+    def test_the_constants_from_kit_314_reach_the_model_as_written(self):
+        # Measured before the change: only the first was redacted. `TOKENS` is
+        # a different name, and its `S` ends the match before the separator.
+        for line in (
+            "CHARS_PER_TOKEN = 4",
+            "OUTPUT_TOKENS_PER_CALL = 12_000",
+            "DEFAULT_CLAUDE_REVIEW_MAX_TOKENS = 32000",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(line, claude_review.redact(line))
+
+    def test_a_bare_number_that_ends_the_value_is_left_as_written(self):
+        for line in (
+            "+CHARS_PER_TOKEN = 4",
+            "CHARS_PER_TOKEN = 4  # a rough average",
+            "COST_PER_TOKEN = 0.000_003",
+            "MAX_TOKEN = 4.",
+            # The annotation is read through. Without that, the retry with no
+            # annotation redacted `int` and left `= 4` dangling after it.
+            "CHARS_PER_TOKEN: int = 4",
+            "CHARS_PER_TOKEN: int | None = 4",
+            "const CHARS_PER_TOKEN = 4;",
+            '{"token": 4}',
+            "f(token=4, x=1)",
+            "token:\n+  4",
+            # A closer ends the number when the value ends with it.
+            "{token: 4}",
+            "{ a: { token: 4 } }",
+            "f({token: 4}, x)",
+            "x = [token=4];",
+            "{token: 4}  # a rough average",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(line, claude_review.redact(line))
+
+    def test_anything_more_than_a_number_is_still_redacted(self):
+        whole = 'token="<REDACTED>"'
+        # Pairs, not a dict keyed on the input: a dict keeps only the last of
+        # two equal keys, so a repeated case would drop out without a sound.
+        cases = (
+            # Only the `token` name. A numeric password is a PIN.
+            ("password = 1234", 'password="<REDACTED>"'),
+            ("secret = 42", 'secret="<REDACTED>"'),
+            # A quote, a letter, a sign or an exponent makes it a value.
+            ('token = "123456"', whole),
+            # ASCII digits only. Escaped, so this source stays ASCII:
+            # fullwidth and Arabic-Indic digits are digits to `\d`.
+            ("token = \uff11\uff12\uff13\uff14\uff15\uff16", whole),
+            ("token = \u0661\u0662\u0663\u0664", whole),
+            ("token = 0x1F", whole),
+            ("token = 3e-6", whole),
+            ("token = -1", whole),
+            ("token = 4hunter2", whole),
+            # A number that does not END the value takes the chain with it.
+            ('token = 4 + "hunter2"', whole),
+            ('token=4+"hunter2"', whole),
+            ('token = 4 or "hunter2"', whole),
+            ('token=4.."hunter2"', whole),
+            ("token: int = 4 + x", 'token:"<REDACTED>"'),
+            # And combined with the conditionals that were already there: an
+            # annotation with a union, a quoted JSON key, and the YAML value on
+            # the line below its key behind a diff marker.
+            ('token: int = 4 or "hunter2"', 'token:"<REDACTED>"'),
+            ('token: int | None = 4 + "hunter2"', 'token:"<REDACTED>"'),
+            ('{"token": 4 + "hunter2"}', '{"token":"<REDACTED>"}'),
+            ('token:\n+  4 + "hunter2"', 'token:"<REDACTED>"'),
+            # The Telegram bot token shape opens with digits and runs on past
+            # the colon. Split, so this source line carries no key shape.
+            (
+                "BOT_TOKEN = 123456789:" + "AbCdEf0123456789" * 2 + "ZzY",
+                'BOT_TOKEN="<REDACTED>"',
+            ),
+        )
+        for line, want in cases:
+            with self.subTest(line=line):
+                self.assertEqual(want, claude_review.redact(line))
+
+    def test_a_closer_ends_the_number_only_where_the_value_ends(self):
+        """A `]` or `}` with more of the value glued behind it is not an end.
+
+        The bare branch reads through both, so before #317 `4]` and what
+        followed it redacted as one value. The exemption stopped at the
+        closer and handed the rest to the model, which the review of
+        capaz#65 found and #317's own generator could not express.
+        """
+        whole = 'token="<REDACTED>"'
+        cases = (
+            ("token = 4]wJalrXUtnFEMIK7MDENG", whole),
+            ("token = 4}wJalrXUtnFEMIK7MDENG", whole),
+            ('token = 4] + "hunter2"', whole),
+            ('token = 4}+"hunter2"', whole),
+            # Split, so this source line carries no credential-URL shape.
+            (
+                "url = postgres://u:${TOKEN:=0}" + "hunter2@host/db",
+                'url = postgres://u:${TOKEN:="<REDACTED>"',
+            ),
+            # One string holding a JSON object: the closer and then the
+            # string's quote end the value, as the bare value ends there.
+            ('\'{"token": 4}\'', '\'{"token": 4}\''),
+        )
+        for line, want in cases:
+            with self.subTest(line=line):
+                self.assertEqual(want, claude_review.redact(line))
+
+    def test_no_glued_closer_hands_the_rest_of_the_value_over(self):
+        # ZERO IS THE BASELINE: every case here redacted before #317, and
+        # every one leaked after it. A closer followed by `)` is not
+        # generated: the bare branch stops at `)` as well, the adjacency gap
+        # HARNESS.md records, so those leaked before #317 too.
+        secret = "AbCdEf0123456789ZzYyXx"
+        assignments = (
+            "token={}", "token = {}", "token: {}", "token:={}",
+            "CHARS_PER_TOKEN = {}", '"token": {}', "CHARS_PER_TOKEN: int = {}",
+        )
+        closers = ("]", "}", "]]", "}]")
+        tails = (
+            "{s}", ' + "{s}"', '+"{s}"', ' or "{s}"', '.."{s}"', ":{s}",
+            "@{s}", "/{s}",
+        )
+        contexts = (("", ""), ("f(", ")"), ("{ ", " }"), ("+  ", ""))
+        leaked, count = [], 0
+        for a, num, closer, tail, (before, after) in itertools.product(
+            assignments, ("4", "12_000.5"), closers, tails, contexts,
+        ):
+            line = before + a.format(num + closer + tail.format(s=secret)) + after
+            count += 1
+            if secret in claude_review.redact(line):
+                leaked.append(line)
+        # A check that scanned nothing is not a pass.
+        self.assertEqual(1792, count)
+        self.assertEqual([], leaked[:12])
+
+    def test_a_vendor_key_made_of_digits_is_still_redacted(self):
+        # No vendor entry is all digits. These three come nearest: a fixed
+        # prefix, then nothing but digits. Under a `token` name the value opens
+        # with a letter, so the exemption never reads it, and on its own the
+        # prefix half takes it. Built at runtime, like the keyed message above.
+        for prefix, body in (
+            ("SK", "0123456789" * 3 + "01"),
+            ("dop_v1_", "0123456789" * 6 + "0123"),
+            ("sbp_", "0123456789" * 4),
+        ):
+            key = prefix + body
+            with self.subTest(prefix=prefix):
+                self.assertEqual(
+                    'API_TOKEN="<REDACTED>"', claude_review.redact(f"API_TOKEN = {key}")
+                )
+                self.assertEqual(
+                    f"key {prefix}<REDACTED>", claude_review.redact(f"key {key}")
+                )
+
+    def test_the_residual_is_pinned_not_assumed(self):
+        """What the exemption costs, asserted so HARNESS.md cannot drift.
+
+        A credential made only of digits under a `token` name, such as a
+        six-digit one-time code, reaches the model as written.
+        """
+        line = "OTP_TOKEN = 839201"
+        self.assertEqual(line, claude_review.redact(line))
+
+
+class AKeyGluedIntoABareValueGetsItsOwnMatch(unittest.TestCase):
+    """A bare value ends in front of a key the table knows.
+
+    It read through a glued key and its separator like any other text, so one
+    match swallowed the next key and the scan resumed past that key's value.
+    `token = abc]password: hunter2` reached the model as
+    `token="<REDACTED>" hunter2` on main; on review of #327 the same path sent
+    a declined exemption's second key to the model. Exact output, both
+    directions: the glued key is redacted on its own, and a value that merely
+    contains a key name stays one value.
+    """
+
+    def test_a_glued_key_is_redacted_on_its_own(self):
+        both = 'token="<REDACTED>"password:"<REDACTED>"'
+        cases = (
+            ("token = abc]password: hunter2", both),
+            ("token = abcpassword: hunter2", both),
+            ("token=x#password: hunter2", both),
+            # The key matches on its tail, so the head goes with the first value.
+            ("token=x]db_password: hunter2", both),
+            ("token=x]STRIPE_SECRET_KEY=hunter2", 'token="<REDACTED>"SECRET_KEY="<REDACTED>"'),
+            ('token = abc]password="hunter2"', 'token="<REDACTED>"password="<REDACTED>"'),
+            ("token = abc]password = hunter2", 'token="<REDACTED>"password="<REDACTED>"'),
+            ("token=x.api_key => hunter2", 'token="<REDACTED>"api_key=>"<REDACTED>"'),
+            # A declined number took this path between #317 and this change.
+            ("token = 4]password: hunter2", both),
+            ("password: token: abc", 'password: token:"<REDACTED>"'),
+            (
+                "url = https://x/?token=abc&password=hunter2",
+                'url = https://x/?token="<REDACTED>"password="<REDACTED>"',
+            ),
+        )
+        for line, want in cases:
+            with self.subTest(line=line):
+                self.assertEqual(want, claude_review.redact(line))
+
+    def test_a_key_name_with_no_separator_stays_inside_the_value(self):
+        for line, want in (
+            ("token = my_password_hash", 'token="<REDACTED>"'),
+            ("token = secretkeybase", 'token="<REDACTED>"'),
+            ("password = token_abc", 'password="<REDACTED>"'),
+            ("password = get_token()", 'password="<REDACTED>"'),
+            ("api_key = tokenizer.secret", 'api_key="<REDACTED>"'),
+            ("token: secret_value", 'token:"<REDACTED>"'),
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(want, claude_review.redact(line))
+
+    def test_no_glued_key_hands_its_value_over(self):
+        # ZERO IS THE BASELINE. At kit #327's head, 34a153e, most of these
+        # leaked the second value; on main the plain values did too.
+        secret = "AbCdEf0123456789ZzYyXx"
+        firsts = ("token = {}", "password: {}")
+        values = ("abc", "4", "f(x)", "a[0]", "${X:-d}", "x.y")
+        glues = ("", "]", "}", "]]", "#", ".", "/", ":")
+        keys = ("password", "db_password", "STRIPE_SECRET_KEY", "api_key", "x.token", "Password")
+        seconds = (": {s}", "={s}", " = {s}", " => {s}", '="{s}"', ":={s}")
+        contexts = (("", ""), ("f(", ")"), ("{ ", " }"), ("+  ", ""))
+        leaked, count = [], 0
+        for first, value, glue, key, second, (before, after) in itertools.product(
+            firsts, values, glues, keys, seconds, contexts,
+        ):
+            line = before + first.format(value + glue + key + second.format(s=secret)) + after
+            count += 1
+            if secret in claude_review.redact(line):
+                leaked.append(line)
+        # A check that scanned nothing is not a pass.
+        self.assertEqual(13824, count)
+        self.assertEqual([], leaked[:12])
+
+    def test_the_residual_is_pinned_not_assumed(self):
+        # The chain's bare operand after a spaced `+` still reads through a
+        # key, so the second value reaches the model, as it did on main.
+        self.assertEqual(
+            'token="<REDACTED>" hunter2', claude_review.redact("token = a + password: hunter2")
+        )
+
+
+class AnExemptNameEndsWhereItsValueDoes(unittest.TestCase):
+    """The name exemptions end at `_VALUE_END`, the end every exemption shares.
+
+    The bare value reads through `]` and `}`, and the self-reshape, pattern and
+    env-lookup exemptions stopped at either, so text glued behind the closer
+    reached the model. Each shape below did so on main, at kit #327's head and
+    at dba33db, before #317. Exact output, both directions.
+    """
+
+    SECRET = "wJalrXUtnFEMIK7MDENG"
+
+    def test_text_glued_behind_a_closer_is_still_the_value(self):
+        whole = 'token="<REDACTED>"'
+        for value in (
+            "token = token.strip()]",
+            "token = token.strip()}",
+            "token = token[0]]",
+            "token=(?:a|b)]",
+            "token={value}]",
+            "token=/a.*b/]",
+            "token = os.environ.get('TOKEN')]",
+            "token = process.env.TOKEN]",
+            "token = process.env.TOKEN}",
+        ):
+            line = value + self.SECRET
+            with self.subTest(line=line):
+                self.assertEqual(whole, claude_review.redact(line))
+        # A word glued behind the env call is the value's too.
+        self.assertEqual(whole, claude_review.redact('token = os.getenv("X")hunter2'))
+
+    def test_a_key_glued_behind_the_closer_gets_its_own_match(self):
+        for line, want in (
+            ("token = token.strip()]password: hunter2", 'token="<REDACTED>"password:"<REDACTED>"'),
+            (
+                'token = process.env.TOKEN]password="hunter2"',
+                'token="<REDACTED>"password="<REDACTED>"',
+            ),
+            ("token={value}]password: hunter2", 'token="<REDACTED>"password:"<REDACTED>"'),
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(want, claude_review.redact(line))
+
+    def test_an_exempt_name_that_ends_its_value_is_left_as_written(self):
+        for line in (
+            "token = token.strip()",
+            "f(token=token.strip())",
+            "{token: token.strip()}",
+            "{token: process.env.TOKEN}",
+            "f({token: token.strip()}).then(x)",
+            "new Client({token: process.env.TOKEN}).connect()",
+            'log(f"[token={token}]")',
+            "const token = process.env.GITHUB_TOKEN!;",
+            "const token = process.env.TOKEN||'';",
+            'token = os.getenv("TOKEN").strip()',
+            # Main redacted these five. A blank already ends the value, so a
+            # closer or a comment after it does too; the chain's old end read
+            # `$` without re.M and matched only at the end of the whole text.
+            "{ a: { token: token.strip() } }",
+            "token = token.strip()  # trim",
+            "token = token.strip()\nnext = 1",
+            "m = {token: (?:a|b)}",
+            "f({token: /(?:a|b)/}).x",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(line, claude_review.redact(line))
+
+    def test_no_glued_closer_hands_text_to_the_model(self):
+        # ZERO IS THE BASELINE. Every exemption kind, every glued closer run,
+        # a secret or a second key glued behind it, four enclosing contexts.
+        # Not generated, and pinned below instead: a regex literal holding a
+        # group, whose bare value stops at the group's `)`, and a quote or `)`
+        # glued behind the closer, where the bare value stops as well.
+        secret = "AbCdEf0123456789ZzYyXx"
+        values = (
+            "token = token.strip()", "token: token.strip()", "token = token[0]",
+            "token = token.split(',')[0]", "token=(?:a|b)", "token=(.*)",
+            "token={value}", "token=/a.*b/", "token = os.environ.get('TOKEN')",
+            'token = os.getenv("X")', "token = process.env.TOKEN",
+            "token: process.env.TOKEN", "token = 4", "CHARS_PER_TOKEN: int = 12_000.5",
+            "password: ${PW:?set it}",
+        )
+        closers = ("]", "}", "]]", "}]", "]}", "}}")
+        tails = (
+            "{s}", ":{s}", "@{s}", "/{s}", "-{s}", "#{s}", ".{s}", "+{s}",
+            ' + "{s}"', '+"{s}"', ' or "{s}"', "password: {s}", "password:{s}",
+            "token={s}", "#password: {s}", 'password="{s}"', "db_password: {s}",
+            "x.password = {s}", "api_key => {s}", "STRIPE_SECRET_KEY={s}",
+            "{s}password: {s}",
+        )
+        contexts = (("", ""), ("f(", ")"), ("{ ", " }"), ("+  ", ""))
+        leaked, count = [], 0
+        for value, closer, tail, (before, after) in itertools.product(
+            values, closers, tails, contexts,
+        ):
+            line = before + value + closer + tail.format(s=secret) + after
+            count += 1
+            if secret in claude_review.redact(line):
+                leaked.append(line)
+        # A check that scanned nothing is not a pass.
+        self.assertEqual(7560, count)
+        self.assertEqual([], leaked[:12])
+
+    def test_the_residuals_are_pinned_not_assumed(self):
+        """What survives, asserted so HARNESS.md cannot drift.
+
+        Each reaches the model exactly as on main. `)` and a quote glued
+        behind the value lie past the point where the bare value stops; the
+        env lookup has no end but a closer or a word character; a type word
+        before a closer is an annotation; a pattern ends at whitespace even
+        when a chain follows; and the self-reshape chain reads an attribute
+        name, which an identifier-shaped secret can be.
+        """
+        for line in (
+            "token = token.strip())" + self.SECRET,
+            'token = token.strip()]"' + self.SECRET + '"',
+            "token = process.env.TOKEN-" + self.SECRET,
+            "password = str]" + self.SECRET,
+            "token=(?:a|b) + '" + self.SECRET + "'",
+            "token = token." + self.SECRET,
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(line, claude_review.redact(line))
+        # A regex literal holding a group: the bare value stops at the group's
+        # `)`, so the glued tail survives and the literal is cut.
+        self.assertEqual(
+            'token="<REDACTED>")/i]' + self.SECRET,
+            claude_review.redact("token=/(?:a|b)/i]" + self.SECRET),
+        )
+        # A call on the literal itself reads as more of the value, so the
+        # value redacts where main left it: an over-redaction.
+        self.assertEqual(
+            'parts = {token:"<REDACTED>")',
+            claude_review.redact('parts = {token: token.split(",")[0]}.items()'),
+        )
+
+
 class ReenteringRedactIsLoud(unittest.TestCase):
     """`redact()` cannot serve two passes at once, and says so.
 
@@ -1316,7 +1848,10 @@ class NoCombinationOfShapesLeaksALiteral(unittest.TestCase):
     # find it, which is the hand-written pin's blind spot one level up.
     SPACE_BEFORE_OP = ["", " "]
     SPACE_AFTER_OP = ["", " "]
-    LEADS = ["", "pre", "f()"]
+    # A NUMBER IS A LEAD TOO. A bare number under `token` is exempt
+    # (`_NUMBER`), and the exemption has to stop where the value does: every
+    # operator and spacing here must still take the literal behind it.
+    LEADS = ["", "pre", "f()", "12_000.5"]
     CONTEXTS = [("", ""), ("f(", ")"), ('f("', '")'), ("{ ", " }"), ("+  ", "")]
 
     def cases(self):
@@ -1738,6 +2273,97 @@ class TheKeyDoesNotFollowARedirect(unittest.TestCase):
         self.assertIn("NOT sent onward", body)
 
 
+class TheTokenDoesNotFollowARedirect(unittest.TestCase):
+    """The GitHub token rode along on a redirect, as the API key did above.
+
+    pr_diff() sends `authorization: Bearer $GH_TOKEN` to the GitHub API, and it
+    went through urllib's default opener, which copies that header onto a
+    redirect to any host. Found in review on capaz#65. Measured on CPython
+    3.12.13 and 3.14.0 before the fix: a 302 from one loopback server to a
+    second one handed the second the token verbatim, and the handler copied it
+    onto an https-to-http redirect too.
+
+    Real sockets, for the same reason as the class above: the claim is about
+    what urllib does.
+    """
+
+    def _serve(self, handler_cls):
+        server = http.server.HTTPServer(("127.0.0.1", 0), handler_cls)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        # Cleanups run last first: stop serve_forever, then close its socket.
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_address[1]
+
+    def _endpoints(self):
+        """A GitHub API stand-in that redirects every GET to a collector."""
+        seen = {}
+
+        class Collector(http.server.BaseHTTPRequestHandler):
+            def do_GET(inner):
+                seen.update({k.lower(): v for k, v in inner.headers.items()})
+                inner.send_response(200)
+                inner.send_header("content-type", "application/json")
+                inner.end_headers()
+                inner.wfile.write(b"[]")
+
+            def log_message(inner, *a):
+                pass
+
+        collector_port = self._serve(Collector)
+
+        class Redirector(http.server.BaseHTTPRequestHandler):
+            def do_GET(inner):
+                inner.send_response(302)
+                inner.send_header(
+                    "Location", f"http://127.0.0.1:{collector_port}/collect"
+                )
+                inner.end_headers()
+
+            def log_message(inner, *a):
+                pass
+
+        return seen, f"http://127.0.0.1:{self._serve(Redirector)}"
+
+    def test_the_default_opener_would_have_sent_the_token_on(self):
+        # The leak, through these same two servers, so the test below cannot
+        # pass because the redirect never reached the collector.
+        seen, api = self._endpoints()
+        request = urllib.request.Request(
+            f"{api}/repos/o/r/pulls/1/files",
+            headers={"authorization": "Bearer SENTINEL"},
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response.read()
+        self.assertEqual("Bearer SENTINEL", seen.get("authorization"))
+
+    def test_the_pr_diff_refuses_the_redirect_and_the_target_gets_nothing(self):
+        seen, api = self._endpoints()
+        env = {"PR_NUMBER": "1", "GITHUB_REPOSITORY": "o/r", "GH_TOKEN": "SENTINEL"}
+        with mock.patch.object(claude_review, "GITHUB_API", api), mock.patch.dict(
+            os.environ, env
+        ), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                claude_review.pr_diff()
+        caught.exception.close()
+        self.assertEqual(302, caught.exception.code)
+        self.assertEqual({}, seen, "the redirect target received a request at all")
+
+    def test_no_request_in_the_reviewer_uses_the_default_opener(self):
+        # Every request the reviewer sends carries the GitHub token or the API
+        # key, so every one goes through an opener built on _NoRedirect. This
+        # finds a new urlopen() call wherever it is added, not only the one
+        # fixed here.
+        tree = ast.parse(Path(claude_review.__file__).read_text(encoding="utf-8"))
+        lines = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and "urlopen" in (getattr(node.func, "attr", None), getattr(node.func, "id", None))
+        ]
+        self.assertEqual([], lines, "claude_review.py calls urlopen() on these lines")
+
+
 class ATruncatedBodyStillPostsAReason(unittest.TestCase):
     """A response cut off mid-body raised straight out of call_claude().
 
@@ -1828,7 +2454,26 @@ class AFailureBeforeAnyBodyIsNotACutOffBody(unittest.TestCase):
 
         class Garbage(socketserver.BaseRequestHandler):
             def handle(inner):
-                inner.request.recv(65536)
+                # The whole request is read before the answer. http.client
+                # writes the headers and the body separately, so one recv()
+                # often got only the headers; the body then reached a closed
+                # socket, Windows reset the connection, and the client raised
+                # ConnectionResetError or ConnectionAbortedError instead of
+                # reading the status line: 58 of 300 runs (kit #315).
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    chunk = inner.request.recv(65536)
+                    if not chunk:
+                        return
+                    data += chunk
+                head, _, body = data.partition(b"\r\n\r\n")
+                length = re.search(rb"(?im)^content-length:[ \t]*(\d+)", head)
+                remaining = int(length.group(1)) - len(body) if length else 0
+                while remaining > 0:
+                    chunk = inner.request.recv(remaining)
+                    if not chunk:
+                        return
+                    remaining -= len(chunk)
                 inner.request.sendall(b"<html>502 Bad Gateway</html>\r\n\r\n")
                 inner.request.close()
 
@@ -2062,6 +2707,81 @@ class AVendorKeyIsRecognisedWithoutParsingTheLine(unittest.TestCase):
                 glued = f"ENV SOME_TOKEN X{value}"
                 self.assertEqual(glued, claude_review.redact(glued))
 
+    # Written out once and split, like VENDOR_SAMPLES: the source line carries
+    # no key shape, so the reviewer reading a diff of this file sees it whole.
+    WRITTEN_OUT_KEYS = (
+        ("sk-", "sk-" + "abcdefghij0123456789", "sk-<REDACTED>"),
+        ("AKIA", "AKIA" + "IOSFODNN7EXAMPLE", "AKIA<REDACTED>"),
+    )
+
+    def test_a_pack_code_ending_in_desk_reaches_the_model_whole(self):
+        """The line capaz#16's reviewer was shown as `help-desk-<REDACTED>`.
+
+        `sk-` and `AKIA` are written out in SECRET_PATTERNS, above the build
+        site where `_VENDOR_KEYS` takes the boundary, so they matched inside
+        words: the `sk-` in `desk-` plus twenty characters is an OpenAI key by
+        shape. The reviewer then reported its own redaction as blocking data
+        corruption in a pack file that was correct.
+        """
+        line = '+    "code": "msp.domain.help-desk' + '-and-end-user-support",'
+        self.assertEqual(line, claude_review.redact(line))
+
+    def test_the_written_out_key_entries_skip_a_longer_word_too(self):
+        for label, key, _shown in self.WRITTEN_OUT_KEYS:
+            for glued in (f"de{key}", f"X{key}", f"SOME_VAR_{key}"):
+                with self.subTest(entry=label, glued=glued):
+                    self.assertEqual(glued, claude_review.redact(glued))
+
+    def test_the_written_out_key_entries_still_fire_on_a_real_key(self):
+        """The boundary must not switch these two off, so assert both directions.
+
+        An escape or a percent-encoded byte ends a word, though its last
+        character is a word character: on review of #306, `"line1\\nsk-..."`,
+        `"\\tAKIA..."` and `a%3Dsk-...` reached the model whole. These are the
+        two-character escapes as a diff carries them, not real control bytes.
+        """
+        for label, key, shown in self.WRITTEN_OUT_KEYS:
+            for line in (
+                f"ENV SOME_TOKEN {key}",
+                f"see the runbook: {key}",
+                f"some-{key}",
+                f'msg = "line1\\n{key}"',
+                f'x = "\\t{key}"',
+                f'x = "a\\r{key}"',
+                f'q = "a%3D{key}"',
+                f"q=a%3d{key}",
+            ):
+                with self.subTest(entry=label, line=line):
+                    out = claude_review.redact(line)
+                    self.assertNotIn(key, out)
+                    self.assertIn(shown, out)
+
+    def test_every_key_shape_entry_carries_the_boundary(self):
+        """The whole table, enumerated, so the next written-out entry cannot miss it.
+
+        The boundary went on at the `_VENDOR_KEYS` build site and skipped the two
+        entries written out above it; a test pinned to those two would miss a
+        third. Two kinds of entry are exempt by what they are: the key=value rule,
+        whose replacement is a function because it parses syntax rather than
+        matching a prefix, and the PEM block, which opens on `-----BEGIN`.
+        Everything else is a key shape and opens on `_NOT_MID_IDENTIFIER`.
+        """
+        checked = 0
+        for pattern, replacement in claude_review.SECRET_PATTERNS:
+            if callable(replacement) or pattern.pattern.startswith("-----BEGIN"):
+                continue
+            checked += 1
+            with self.subTest(pattern=pattern.pattern[:60]):
+                self.assertTrue(
+                    pattern.pattern.startswith(claude_review._NOT_MID_IDENTIFIER),
+                    "a key-shape entry without the boundary matches inside words",
+                )
+        # A floor, so a table that moved out from under this loop cannot pass
+        # it by checking nothing: the written-out entries plus every vendor.
+        self.assertGreaterEqual(
+            checked, len(self.WRITTEN_OUT_KEYS) + len(claude_review._VENDOR_KEYS)
+        )
+
     def test_the_boundarys_own_blind_spot_is_pinned_not_assumed(self):
         """What the word boundary costs, asserted so the doc cannot drift.
 
@@ -2070,17 +2790,33 @@ class AVendorKeyIsRecognisedWithoutParsingTheLine(unittest.TestCase):
         price of not blanking `TASK` + 32 hex, and it is worth pinning in
         BOTH directions so a future widening of the class shows up here as a
         failure rather than as a silent change of behaviour.
+
+        `sk-` and `AKIA` took the boundary on #306, and its cost with it: on
+        main they matched anywhere, so `key_sk-...` was redacted and now is
+        not. An escape (`\\n`, `\\r`, `\\t`) or a percent-encoded byte (`%3D`)
+        is not part of the word, so a key behind one IS caught; any other
+        escape (`\\x41`) ends in a word character and reads as the word going on.
         """
-        key = "ghp_" + "16C7e42F292c6912E7710c838347Ae178B4a"
-        # Glued to an identifier: this half does not reach it.
-        for line in (f"SOMEVAR_{key}", f"SOMEVAR{key}", f"MYVAR=SOMEVAR_{key}"):
-            with self.subTest(missed=line):
-                self.assertIn(key, claude_review.redact(line))
-        # But a hyphen is not an identifier character, so this one IS caught --
-        # the deliberate asymmetry, kept biased toward over-redaction.
-        self.assertNotIn(key, claude_review.redact(f"some-{key}"))
-        # And the OTHER half still reaches a glued key under a known name.
-        self.assertNotIn(key, claude_review.redact(f'token = "SOMEVAR_{key}"'))
+        ghp = "ghp_" + "16C7e42F292c6912E7710c838347Ae178B4a"
+        keys = [(ghp[:4], ghp)] + [(label, key) for label, key, _ in self.WRITTEN_OUT_KEYS]
+        for label, key in keys:
+            # Glued to an identifier or behind a word-ending escape: this half
+            # does not reach it.
+            for line in (
+                f"SOMEVAR_{key}", f"SOMEVAR{key}", f"MYVAR=SOMEVAR_{key}",
+                f"key_{key}", f'"\\x41{key}"',
+            ):
+                with self.subTest(entry=label, missed=line):
+                    self.assertIn(key, claude_review.redact(line))
+            # A hyphen is not an identifier character, so that one IS caught --
+            # the deliberate asymmetry, kept biased toward over-redaction -- and
+            # so is a key behind an escape or a percent-encoded byte.
+            for line in (f"some-{key}", f'"a\\n{key}"', f'"\\t{key}"', f"q=a%3D{key}"):
+                with self.subTest(entry=label, caught=line):
+                    self.assertNotIn(key, claude_review.redact(line))
+            # And the OTHER half still reaches a glued key under a known name.
+            with self.subTest(entry=label, named=True):
+                self.assertNotIn(key, claude_review.redact(f'token = "SOMEVAR_{key}"'))
 
     def test_the_boundary_did_not_switch_the_detectors_off(self):
         """The other half of the pin, because a boundary can fix by breaking.
@@ -2312,6 +3048,33 @@ class RedactionIsLinear(unittest.TestCase):
             "many keys, many spaces": "password: " * 200_000,
             "a long type union": "password: " + "str | " * 100_000 + "x",
             "many bare type words": "password: " + "str " * 200_000,
+            # THE SPACES AFTER THE SEPARATOR. Two `[ \t]*` around the optional
+            # line break could share one run of spaces in about K*K/2 ways, and
+            # a value the rule then declined made the engine try every one:
+            # 8,000 spaces took 36 to 41 seconds. An exempt number and no value
+            # at all are the two ways to decline.
+            "spaces before an exempt number": "token =" + " " * 50_000 + "4",
+            "spaces and no value": "password = " + " " * 50_000,
+            # `_VALUE_END` reads a run of closers before the value is ended or
+            # declined, so each reading of the spaces paid for the whole run:
+            # 1,000 spaces and a million closers took 55 seconds. The run ends
+            # the number at the end of the text and is declined before `x`,
+            # and every exemption that shares the end gets the declined shape.
+            "spaces before an exempt number and a closer run": (
+                "token = " + " " * 1_000 + "4" + "]" * 1_000_000
+            ),
+            "spaces, a number and a closer run it declines": (
+                "token = " + " " * 1_000 + "4" + "]" * 1_000_000 + "x"
+            ),
+            "spaces, a self-reshape and a closer run it declines": (
+                "token = " + " " * 1_000 + "token.strip()" + "]" * 1_000_000 + "x"
+            ),
+            "spaces, an env lookup and a closer run it declines": (
+                "token = " + " " * 1_000 + "process.env.TOKEN" + "}" * 1_000_000 + "x"
+            ),
+            "spaces, a pattern and a closer run it declines": (
+                "token = " + " " * 1_000 + "(?:a|b)" + "]" * 1_000_000 + "x"
+            ),
             # The exemption added a bounded group match with one level of
             # nested-paren tolerance, so these are its own pathological shapes.
             "a huge alternation under a secret name": "password=(?:" + "a|" * 200_000 + "b)",
@@ -2412,6 +3175,40 @@ class RedactionIsLinear(unittest.TestCase):
             "alternating attribute and subscript": "token=token" + ".a[0]" * 60_000,
             "chain that fails at the terminator": "token=token" + ".a" * 100_000 + "!",
             "chain of unclosed calls": "token=token" + ".a(" * 100_000,
+            # THE PARAMETER EXPANSION (capaz#21). Both of its branches read to a
+            # closing brace under a bound of 200, so a brace that never closes, a
+            # message that never ends and a line of them are its own shapes.
+            "an expansion that never closes": "password=${A" + "b" * 1_000_000,
+            "a message that never ends": "password: ${A:?" + "b" * 1_000_000,
+            "many expansions that do not end the value": "password: ${A:?m}x " * 100_000,
+            "many inner keys refused at the separator": "x:${PASSWORD:?m}" * 100_000,
+            # THE NUMBER EXEMPTION (`_NUMBER`). Its lookahead reads a digit run
+            # and an optional annotation, so a run that never ends its value, a
+            # long union in front of one and a file of constants are its shapes.
+            "a number that never ends its value": "token=" + "1" * 1_000_000 + "x",
+            "a number of underscores": "token=1" + "_" * 1_000_000 + "x",
+            "a long type union before a number": "token: " + "int | " * 100_000 + "= 4",
+            "many numeric token constants": "CHARS_PER_TOKEN = 4\n" * 200_000,
+            # `_VALUE_END` reads a run of closers, spaced or not, before it
+            # decides; a run that never reaches an end is its shape.
+            "a closer run that never ends its value": "token=4" + "] " * 300_000 + "x",
+            "a closer run of spaces": "token=4]" + " " * 1_000_000 + "x",
+            # `_BARE_CHAR` asks at every character whether a key and its
+            # separator start there. Key names that never reach a separator,
+            # a run of names with prefixes in common, a name before a megabyte
+            # of blanks, and a run of glued keys that each end a value.
+            "key names that never reach a separator": "token=4]" + "password" * 150_000,
+            "a run of overlapping key names": "token=x" + "secret_key" * 100_000,
+            "a key name before a megabyte of blanks": "token=xpassword" + " " * 1_000_000 + "y",
+            "a run of glued keys": "token=x" + "password:" * 100_000,
+            "a closer then a megabyte of bare text": "token=x]" + "a" * 1_000_000,
+            "a closer run then a key": "token=x" + "]" * 300_000 + "password: y",
+            # `_VALUE_END` reads a glued closer run, then blanks, before it
+            # decides, and the env lookup's name can give letters back.
+            "a glued closer run that never ends": "token=token.strip()" + "]" * 1_000_000 + "x",
+            "closers then blanks then a word": "token=4" + "}" * 300_000 + " " * 300_000 + "x",
+            "a closer run then a quote": "token={v}" + "}" * 1_000_000 + "'",
+            "a long env name glued to a closer": "token=process.env." + "A" * 1_000_000 + "]x",
         }
         for label, text in shapes.items():
             with self.subTest(shape=label):
@@ -3617,13 +4414,16 @@ class AnAppendIsAnAssignment(unittest.TestCase):
                 self.assertEqual(line, claude_review.redact(line))
 
 
-class ACutDiffSaysWhatItLeftOut(unittest.TestCase):
-    """Measured on EGI_bot#117 (2026-09-24), a ~5,000-line kit sync.
+class ALongDiffIsReadWholeInParts(unittest.TestCase):
+    """A diff longer than one call is read whole, in parts, and never cut.
 
-    `redact(diff)[:MAX_REVIEW_CHARS]` cut the diff mid-line with no marker. The
-    review called the cut "truncated mid-string" and asked whether it was a
-    syntax error, never mentioned the files after it, and the status was `ok`.
-    MAX_REVIEW_CHARS is patched small here so the fixtures stay readable.
+    It was cut at MAX_REVIEW_CHARS with no marker and passed (EGI_bot#117), then
+    cut, named and failed (kit #284, #292), because the author orders the diff
+    and padding the head carried a change past the cut (capaz#14). Failing named
+    the gap and still read none of it: capaz#57 is 1,124,890 characters, and its
+    review read 120,000. Now every chunk is reviewed and the part reviews are
+    merged. The size is patched small so the fixtures stay readable, and the
+    model is a fake that answers by what it is asked.
     """
 
     CAP = 1000
@@ -3632,91 +4432,142 @@ class ACutDiffSaysWhatItLeftOut(unittest.TestCase):
         patcher = mock.patch.object(claude_review, "MAX_REVIEW_CHARS", self.CAP)
         patcher.start()
         self.addCleanup(patcher.stop)
-        # The review job runs this suite with the repo's CLAUDE_REVIEW_MAX_CHARS
-        # in its environment, and a set value would override the patched cap.
-        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_REVIEW_MAX_CHARS"}
+        # The review job runs this suite with the repo's variables in its
+        # environment, and a set value would override the patched size, the
+        # cap or the prices.
+        env = {
+            k: v for k, v in os.environ.items()
+            if not k.startswith("CLAUDE_REVIEW_") and k != "ANTHROPIC_BASE_URL"
+        }
         env_patcher = mock.patch.dict(os.environ, env, clear=True)
         env_patcher.start()
         self.addCleanup(env_patcher.stop)
+        self.requests = []
+        self.order = []
 
     @staticmethod
-    def _file(name, lines):
-        return f"diff --git a/{name} b/{name}\n" + "".join(
-            f"+line {i} of {name}\n" for i in range(lines)
+    def _file(name, lines, hunks=1):
+        """A file's diff: its header lines, then `hunks` hunks of `lines` added lines."""
+        header = f"diff --git a/{name} b/{name}\n--- a/{name}\n+++ b/{name}\n"
+        return header + "".join(
+            f"@@ -{h * 100},0 +{h * 100},{lines} @@\n"
+            + "".join(f"+{name} hunk {h} line {i}\n" for i in range(lines))
+            for h in range(hunks)
         )
 
     def _diff(self, *files):
-        return "\n".join(self._file(name, lines) for name, lines in files)
+        return "".join(self._file(*spec) for spec in files)
 
-    def test_a_diff_inside_the_budget_is_untouched(self):
+    def _long_diff(self):
+        # a.py and c.py fit in one chunk each; b.py is four hunks of ~650.
+        return self._diff(("a.py", 10, 3), ("b.py", 30, 4), ("c.py", 3))
+
+    @staticmethod
+    def _hunks(text):
+        """Every hunk in `text`, from its @@ line to the next hunk or file."""
+        return re.findall(r"^@@.*?(?=^@@|^diff --git |\Z)", text, flags=re.M | re.S)
+
+    def _chunks(self, diff):
+        return claude_review.chunk_diff(diff, self.CAP)
+
+    def test_a_diff_that_fits_is_one_chunk_untouched(self):
         diff = self._diff(("a.py", 5))
-        self.assertEqual(claude_review.cap_diff(diff), (diff, ""))
+        self.assertEqual(self._chunks(diff), [diff])
 
-    def test_every_file_after_the_cut_is_named(self):
-        diff = self._diff(("a.py", 10), ("b.py", 10), ("c.py", 60), ("d.py", 5))
-        text, note = claude_review.cap_diff(diff)
-        self.assertIn("Cut partway: `c.py`.", note)
-        self.assertIn("Not reviewed at all: `d.py`.", note)
-        # Files that fit whole are not listed as missing.
-        self.assertNotIn("a.py", note)
-        self.assertNotIn("b.py", note)
+    def test_no_hunk_is_split_lost_or_repeated(self):
+        diff = self._diff(("a.py", 10, 3), ("b.py", 30, 4), ("c.py", 3), ("d.py", 12, 6))
+        chunks = self._chunks(diff)
+        self.assertGreater(len(chunks), 2)
+        read = [hunk for chunk in chunks for hunk in self._hunks(chunk)]
+        self.assertEqual(read, self._hunks(diff))
 
-    def test_the_cut_lands_on_a_line_boundary(self):
-        diff = self._diff(("a.py", 200))
-        text, _ = claude_review.cap_diff(diff)
-        kept = text.split("\n--- DIFF CUT HERE", 1)[0]
-        self.assertTrue(diff.startswith(kept))
-        self.assertLessEqual(len(kept), self.CAP)
-        self.assertTrue(kept.endswith("\n"), "the last line reached the model half-written")
+    def test_every_chunk_opens_on_a_file_header(self):
+        for chunk in self._chunks(self._long_diff()):
+            with self.subTest(chunk=chunk[:40]):
+                self.assertTrue(chunk.startswith("diff --git a/"), chunk[:80])
 
-    def test_the_model_is_told_the_cut_is_not_the_authors(self):
-        text, note = claude_review.cap_diff(self._diff(("a.py", 200)))
-        self.assertIn("NOT BY THE AUTHOR", text)
-        self.assertIn(note, text)
+    def test_a_file_that_fits_is_in_exactly_one_chunk(self):
+        chunks = self._chunks(self._long_diff())
+        for name in ("a.py", "c.py"):
+            with self.subTest(name=name):
+                self.assertEqual(sum(f"diff --git a/{name} " in chunk for chunk in chunks), 1)
 
-    def test_one_line_longer_than_the_budget_still_gets_cut(self):
-        text, note = claude_review.cap_diff("x" * (self.CAP * 2))
-        self.assertTrue(text.startswith("x" * self.CAP + "\n--- DIFF CUT HERE"))
-        self.assertIn(f"{self.CAP:,} of {self.CAP * 2:,} characters", note)
+    def test_a_long_file_continues_under_its_header(self):
+        chunks = self._chunks(self._diff(("b.py", 30, 4)))
+        self.assertEqual(len(chunks), 4)
+        for chunk in chunks:
+            with self.subTest(chunk=chunk[:60]):
+                self.assertTrue(chunk.startswith("diff --git a/b.py b/b.py\n--- a/b.py\n"))
+                self.assertLessEqual(len(chunk), self.CAP)
 
-    def test_a_long_list_of_missing_files_is_capped(self):
-        files = [("big.py", 100)] + [(f"f{i}.py", 1) for i in range(100)]
-        _, note = claude_review.cap_diff(self._diff(*files))
-        self.assertIn("and 60 more", note)
+    def test_a_file_longer_than_a_chunk_fills_the_room_left_first(self):
+        # On capaz#57 a 29,042-character first part was sent alone because the
+        # next file started a fresh part: 13 calls where 10 hold the diff.
+        chunks = self._chunks(self._diff(("c.py", 3), ("b.py", 30, 4)))
+        self.assertEqual(len(chunks), 4)
+        self.assertIn("diff --git a/c.py ", chunks[0])
+        self.assertIn("+b.py hunk 0 line 0\n", chunks[0])
 
-    def _main(self, api_content, diff=None):
-        """Run main() over a diff past the cap, with the API answering api_content."""
-        payload = json.dumps({
-            "content": api_content,
-            "stop_reason": "end_turn",
-            "usage": {"input_tokens": 10, "output_tokens": 20},
-        }).encode()
+    def test_a_hunk_longer_than_a_chunk_goes_alone_and_whole(self):
+        diff = self._diff(("a.py", 3), ("huge.py", 200), ("c.py", 3))
+        chunks = self._chunks(diff)
+        self.assertEqual(chunks, [self._file("a.py", 3), self._file("huge.py", 200),
+                                  self._file("c.py", 3)])
+        self.assertEqual("".join(chunks), diff)
 
-        class Response:
-            def read(self):
-                return payload
+    def _model(self, fail_parts=(), truncate_parts=(), empty_parts=(), barrier=None):
+        """The Messages endpoint as a fake, recording every request.
 
-            def __enter__(self):
-                return self
+        A part is answered with the files it shows, and the merge with a fixed
+        review. A part in `fail_parts` answers HTTP 500, one in `empty_parts`
+        answers with no text, and one in `truncate_parts` stops at max_tokens.
+        With `barrier`, parts 2 to barrier.parties + 1 each wait on it, so none
+        of them answers until all of them are in flight together.
+        """
+        def open_(request, timeout=None):
+            sent = json.loads(request.data)
+            self.requests.append(sent)
+            task = sent["messages"][0]["content"][-1]["text"]
+            part = re.match(r"Review part (\d+) of", task)
+            number = int(part.group(1)) if part else 0
+            self.order.append(("start", number))
+            if barrier and 2 <= number <= barrier.parties + 1:
+                barrier.wait()
+            if number in fail_parts:
+                raise urllib.error.HTTPError(
+                    request.full_url, 500, "boom", {}, io.BytesIO(b"upstream down")
+                )
+            if part:
+                files = sorted(set(re.findall(r"^diff --git a/\S+ b/(\S+)$", task, flags=re.M)))
+                text = f"Part {number} read {', '.join(files)}."
+            else:
+                text = "Merged review: nothing to flag."
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = json.dumps({
+                "content": [] if number in empty_parts else [{"type": "text", "text": text}],
+                "stop_reason": "max_tokens" if number in truncate_parts else "end_turn",
+                "usage": {"input_tokens": 100_000, "output_tokens": 5_000},
+            }).encode()
+            self.order.append(("end", number))
+            return response
 
-            def __exit__(self, *exc):
-                return False
+        return mock.patch.object(claude_review._NO_REDIRECT_OPENER, "open", side_effect=open_)
 
-        if diff is None:
-            diff = self._diff(("a.py", 10), ("b.py", 60), ("c.py", 5))
-        env = {
-            "ANTHROPIC_API_KEY": "test-key",
-            "REVIEW_SCOPE": "diff",
-            "BASE_SHA": "base",
-            "HEAD_SHA": "head",
-        }
+    def _main(self, diff, model=None, env=None):
+        """Run main() over `diff` with the fake model. Returns the status and the comment.
+
+        `diff` is also the codebase snapshot, read when `env` sets REVIEW_SCOPE=full.
+        """
+        os.environ.update({
+            "ANTHROPIC_API_KEY": "test-key", "REVIEW_SCOPE": "diff",
+            "BASE_SHA": "base", "HEAD_SHA": "head", **(env or {}),
+        })
         cwd = os.getcwd()
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
-            os.environ, env, clear=False
-        ), mock.patch.object(claude_review, "pr_diff", return_value=diff), mock.patch.object(
-            claude_review._NO_REDIRECT_OPENER, "open", return_value=Response()
-        ):
-            os.environ.pop("ANTHROPIC_BASE_URL", None)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            claude_review, "pr_diff", return_value=(diff, [], ("", ""))
+        ), mock.patch.object(
+            claude_review, "codebase_snapshot", return_value=diff
+        ), model or self._model(), contextlib.redirect_stderr(io.StringIO()):
             os.chdir(tmp)
             try:
                 self.assertEqual(claude_review.main(), 0)
@@ -3726,57 +4577,205 @@ class ACutDiffSaysWhatItLeftOut(unittest.TestCase):
                 os.chdir(cwd)
         return status.strip(), comment
 
-    def test_a_finished_review_of_a_cut_diff_is_partial_not_ok(self):
-        status, comment = self._main([{"type": "text", "text": "Line 3 does two things."}])
-        self.assertEqual(status, claude_review.STATUS_PARTIAL)
-        self.assertTrue(
-            comment.startswith("## Claude Code Review\n\n" + claude_review.PARTIAL_BANNER)
-        )
-        self.assertIn("Not reviewed at all: `c.py`.", comment)
-        self.assertIn("Line 3 does two things.", comment)
+    def _tasks(self):
+        return [request["messages"][0]["content"][-1]["text"] for request in self.requests]
 
-    def test_an_empty_review_of_a_cut_diff_stays_empty(self):
-        # The partial banner must not land in front of a worse status and hide it.
-        status, comment = self._main([{"type": "thinking", "thinking": ""}])
-        self.assertEqual(status, claude_review.STATUS_EMPTY)
-        self.assertNotIn(claude_review.PARTIAL_BANNER, comment)
+    def test_a_long_diff_is_reviewed_in_parts_and_merged(self):
+        diff = self._long_diff()
+        parts = len(self._chunks(diff))
+        status, comment = self._main(diff)
+        self.assertEqual(status, claude_review.STATUS_OK)
+        self.assertEqual(len(self.requests), parts + 1)
+        self.assertTrue(comment.startswith(
+            "## Claude Code Review\n\nMerged review: nothing to flag."
+        ))
 
-    def test_the_gate_fails_the_check_on_partial(self):
-        # It warned at first (kit #284). capaz#14's review showed why that was
-        # wrong: see the padding test below.
-        workflow = TheCheckoutFollowsTheBaseBranch._workflow()
-        self.assertIsNotNone(workflow, "claude-review.yml not found beside this test")
-        case = workflow.split('case "$status" in', 1)[1].split("esac", 1)[0]
-        self.assertIn("partial)", case, "the workflow has no branch for a partial review")
-        branch = case.split("partial)", 1)[1].split(";;", 1)[0]
-        self.assertIn("::error::", branch)
-        self.assertIn("exit 1", branch)
-        self.assertNotIn("partial", case.split(")", 1)[0])
-        # The raw variable may be a typo the script fell back from; the budget
-        # actually used is in the PR comment, so the gate must not echo it.
-        self.assertNotIn("${CLAUDE_REVIEW_MAX_CHARS", branch)
+    def test_every_hunk_reaches_the_model(self):
+        diff = self._long_diff()
+        self._main(diff)
+        read = "".join(self._tasks()[:-1])
+        for hunk in self._hunks(diff):
+            with self.subTest(hunk=hunk[:30]):
+                self.assertIn(hunk, read)
 
     def test_padding_the_head_cannot_carry_a_change_past_the_review(self):
-        """The attack the warning allowed: the author orders the diff.
+        """The attack the cut allowed: filler first, the change that matters after it."""
+        status, _ = self._main(self._diff(("aaa_filler.py", 200), ("zzz_payload.py", 3)))
+        self.assertEqual(status, claude_review.STATUS_OK)
+        self.assertTrue(any("+zzz_payload.py hunk 0 line 2" in task for task in self._tasks()))
 
-        Filler first, the change that matters after the cut. The model never
-        sees it, so the only thing standing between it and a passing check is
-        this status -- which the gate now fails.
-        """
-        diff = self._diff(("aaa_filler.py", 200), ("zzz_payload.py", 3))
-        status, comment = self._main(
-            [{"type": "text", "text": "Nothing to flag."}], diff=diff
+    def test_every_call_opens_with_the_same_cached_context(self):
+        self._main(self._long_diff())
+        contexts = [request["messages"][0]["content"][0] for request in self.requests]
+        self.assertEqual(len({json.dumps(c, sort_keys=True) for c in contexts}), 1)
+        self.assertEqual(contexts[0]["cache_control"], {"type": "ephemeral"})
+        for request in self.requests:
+            self.assertNotIn("cache_control", request["messages"][0]["content"][-1])
+        for name in ("a.py", "b.py", "c.py"):
+            self.assertIn(f"- {name}\n", contexts[0]["text"] + "\n")
+
+    def test_part_one_finishes_before_any_other_part_starts(self):
+        # A cache entry is readable once the response writing it has begun.
+        self._main(self._long_diff())
+        self.assertEqual(self.order[:2], [("start", 1), ("end", 1)])
+
+    def test_the_parts_after_the_first_run_together(self):
+        # Each of parts 2 on waits for the others before it answers, so a
+        # review that sent them one at a time breaks the barrier after 5 seconds.
+        diff = self._long_diff()
+        parts = len(self._chunks(diff))
+        barrier = threading.Barrier(min(claude_review.REVIEW_WORKERS, parts - 1), timeout=5)
+        self.assertGreater(barrier.parties, 1)
+        status, _ = self._main(diff, model=self._model(barrier=barrier))
+        self.assertEqual(status, claude_review.STATUS_OK)
+        self.assertFalse(barrier.broken)
+        self.assertEqual(self.order[:2], [("start", 1), ("end", 1)])
+
+    def test_the_merge_reads_every_part_review(self):
+        diff = self._long_diff()
+        parts = len(self._chunks(diff))
+        self._main(diff)
+        merge = self._tasks()[-1]
+        self.assertTrue(merge.startswith(claude_review.MERGE_TASK))
+        for number in range(1, parts + 1):
+            self.assertIn(f"Part {number} read ", merge)
+
+    def test_a_failed_part_stops_the_merge_and_fails_the_check(self):
+        status, comment = self._main(self._long_diff(), model=self._model(fail_parts=(2,)))
+        self.assertEqual(status, claude_review.STATUS_FAILED)
+        self.assertFalse(any(t.startswith(claude_review.MERGE_TASK) for t in self._tasks()))
+        self.assertIn("Part 2 of", comment)
+        # The parts already paid for are posted.
+        self.assertIn("Part 1 read a.py", comment)
+
+    def test_a_truncated_part_fails_as_truncated(self):
+        status, _ = self._main(self._long_diff(), model=self._model(truncate_parts=(1,)))
+        self.assertEqual(status, claude_review.STATUS_TRUNCATED)
+
+    def test_the_most_severe_part_names_the_failure_whatever_its_place(self):
+        # Failed outranks empty outranks truncated. Part 1 is the least severe
+        # each time, so naming the first part that did not finish gets it wrong.
+        diff = self._long_diff()
+        parts = len(self._chunks(diff))
+        for fail, empty, truncate, expected in (
+            ((3,), (), (1,), claude_review.STATUS_FAILED),
+            ((), (3,), (1,), claude_review.STATUS_EMPTY),
+            ((3,), (2,), (1,), claude_review.STATUS_FAILED),
+        ):
+            with self.subTest(fail=fail, empty=empty, truncate=truncate):
+                self.requests = []
+                status, comment = self._main(diff, model=self._model(
+                    fail_parts=fail, empty_parts=empty, truncate_parts=truncate
+                ))
+                self.assertEqual(status, expected)
+                unfinished = ", ".join(map(str, sorted({*fail, *empty, *truncate})))
+                self.assertIn(f"Part {unfinished} of {parts} did not finish", comment)
+                self.assertFalse(
+                    any(t.startswith(claude_review.MERGE_TASK) for t in self._tasks())
+                )
+
+    def test_one_part_is_one_call_as_before(self):
+        status, _ = self._main(self._diff(("a.py", 5)))
+        self.assertEqual((status, len(self.requests)), (claude_review.STATUS_OK, 1))
+        self.assertNotIn("cache_control", json.dumps(self.requests[0]))
+
+    def test_the_coverage_section_counts_files_parts_and_cost(self):
+        diff = self._long_diff()
+        parts = len(self._chunks(diff))
+        _, comment = self._main(diff)
+        coverage = comment.split("## Claude Review Coverage", 1)[1]
+        self.assertIn("- Files: 3 of 3 reviewable changed files.", coverage)
+        self.assertIn(
+            f"- Diff: {len(diff):,} characters in {parts} parts of at most {self.CAP:,}", coverage
         )
-        self.assertEqual(status, claude_review.STATUS_PARTIAL)
-        self.assertIn("Not reviewed at all: `zzz_payload.py`.", comment)
-        self.assertIn("CLAUDE_REVIEW_MAX_CHARS", comment)
+        # Each fake call bills 100,000 input and 5,000 output tokens at $2/$10.
+        self.assertIn(f"- Spent: ${(parts + 1) * 0.25:.2f},", coverage)
+        self.assertIn("4 characters a token", coverage)
+
+    def test_an_estimate_over_the_cap_sends_nothing_and_fails(self):
+        diff = self._long_diff()
+        status, comment = self._main(diff, env={"CLAUDE_REVIEW_MAX_USD": "0.01"})
+        self.assertEqual((status, self.requests), (claude_review.STATUS_OVER_BUDGET, []))
+        self.assertTrue(comment.startswith(
+            "## Claude Code Review\n\n" + claude_review.OVER_BUDGET_BANNER
+        ))
+        self.assertIn(f"{len(diff):,} characters", comment)
+        self.assertIn("over the $0.01 cap", comment)
+        self.assertIn("raise the CLAUDE_REVIEW_MAX_USD repository variable", comment)
+        self.assertIn("## Claude Review Coverage", comment)
+
+    # 400,000 characters is 100,000 input tokens at $2 a million, plus 12,000
+    # output tokens at $10: $0.32. The output alone is $0.12, under either cap.
+    SNAPSHOT = "x" * 400_000
+
+    def test_a_full_snapshot_over_the_cap_sends_nothing_and_fails(self):
+        status, comment = self._main(
+            self.SNAPSHOT, env={"REVIEW_SCOPE": "full", "CLAUDE_REVIEW_MAX_USD": "0.30"}
+        )
+        self.assertEqual((status, self.requests), (claude_review.STATUS_OVER_BUDGET, []))
+        self.assertTrue(comment.startswith(
+            "## Claude Code Review\n\n" + claude_review.OVER_BUDGET_BANNER
+        ))
+        self.assertIn("400,000 characters", comment)
+        self.assertIn("estimated $0.32", comment)
+        self.assertIn("over the $0.30 cap", comment)
+        self.assertIn("raise the CLAUDE_REVIEW_MAX_USD repository variable", comment)
+
+    def test_a_full_snapshot_under_the_cap_is_one_call(self):
+        status, _ = self._main(
+            self.SNAPSHOT, env={"REVIEW_SCOPE": "full", "CLAUDE_REVIEW_MAX_USD": "0.33"}
+        )
+        self.assertEqual((status, len(self.requests)), (claude_review.STATUS_OK, 1))
+        self.assertIn("Codebase snapshot:", self._tasks()[0])
+
+    def test_a_full_snapshot_without_a_key_says_so_before_the_cost(self):
+        # Same order as a diff: no key is its own status, and the gate excuses
+        # it for Dependabot alone.
+        status, _ = self._main(self.SNAPSHOT, env={
+            "REVIEW_SCOPE": "full", "CLAUDE_REVIEW_MAX_USD": "0.01", "ANTHROPIC_API_KEY": "",
+        })
+        self.assertEqual((status, self.requests), (claude_review.STATUS_NO_KEY, []))
+
+    def test_a_diff_the_size_of_capaz_57_fits_the_default_cap(self):
+        # 1,124,890 characters in 10 parts, measured end to end on kit #311.
+        plan = claude_review.ReviewPlan(
+            ["x" * 112_489] * 10, [f"docs/plan/{n}.md" for n in range(12)], [], 1_124_890
+        )
+        estimate = claude_review.estimate_cost_usd(plan)
+        self.assertGreater(estimate, 1.0)
+        self.assertLess(estimate, claude_review.DEFAULT_MAX_REVIEW_USD)
+
+    def test_the_cap_comes_from_the_environment(self):
+        for value, expected in (("", 5.0), (" 12.5 ", 12.5), ("lots", 5.0), ("-1", 5.0)):
+            with self.subTest(value=value), mock.patch.dict(
+                os.environ, {"CLAUDE_REVIEW_MAX_USD": value}
+            ), contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(claude_review.review_cap_usd(), expected)
+                if value.strip() in ("lots", "-1"):
+                    self.assertIn("CLAUDE_REVIEW_MAX_USD=", err.getvalue())
+
+    def test_the_gate_fails_over_budget_and_partial(self):
+        workflow = TheCheckoutFollowsTheBaseBranch._workflow()
+        self.assertIsNotNone(workflow, "claude-review.yml not found beside this test")
+        self.assertIn("CLAUDE_REVIEW_MAX_USD: ${{ vars.CLAUDE_REVIEW_MAX_USD }}", workflow)
+        case = workflow.split('case "$status" in', 1)[1].split("esac", 1)[0]
+        for status in ("over-budget", "partial"):
+            with self.subTest(status=status):
+                self.assertIn(f"{status})", case)
+                branch = case.split(f"{status})", 1)[1].split(";;", 1)[0]
+                self.assertIn("::error::", branch)
+                self.assertIn("exit 1", branch)
+                # The raw variable may be a typo the script fell back from; the
+                # value actually used is in the PR comment.
+                self.assertNotIn("${CLAUDE_REVIEW_MAX", branch)
+        self.assertNotIn("partial", case.split(")", 1)[0])
 
 
 class TheBudgetComesFromTheEnvironment(unittest.TestCase):
     """CLAUDE_REVIEW_MAX_CHARS, parsed exactly like CLAUDE_REVIEW_MAX_TOKENS.
 
-    A partial review fails the check, so a repo whose PRs are routinely large
-    needs a way to raise the budget that is not an edit to a vendored file.
+    It sizes the parts a long diff is read in. A repo that raised it while it
+    was a cut keeps working: its reviews make fewer, larger calls.
     """
 
     @staticmethod
@@ -3790,12 +4789,15 @@ class TheBudgetComesFromTheEnvironment(unittest.TestCase):
     def test_empty_string_means_the_default(self):
         self.assertEqual(self._budget("")[0], claude_review.MAX_REVIEW_CHARS)
 
-    def test_a_repo_value_wins_and_the_cut_uses_it(self):
+    def test_a_repo_value_wins_and_the_parts_use_it(self):
         self.assertEqual(self._budget(" 400000 ")[0], 400000)
-        diff = "x\n" * 100
-        with mock.patch.dict(os.environ, {"CLAUDE_REVIEW_MAX_CHARS": "50"}):
-            text, note = claude_review.cap_diff(diff)
-        self.assertIn("50 of 200 characters", note)
+        diff = "".join(f"diff --git a/{name} b/{name}\n+x\n" for name in ("a.py", "b.py"))
+        with mock.patch.dict(os.environ, {"CLAUDE_REVIEW_MAX_CHARS": "30"}), mock.patch.object(
+            claude_review, "pr_diff", return_value=(diff, [], ("", ""))
+        ):
+            plan = claude_review.review_plan("base", "head")
+        self.assertEqual(len(plan.chunks), 2)
+        self.assertEqual("".join(plan.chunks), diff)
 
     def test_a_typo_falls_back_out_loud(self):
         got, err = self._budget("lots")
@@ -3807,6 +4809,515 @@ class TheBudgetComesFromTheEnvironment(unittest.TestCase):
         self.assertIn(
             "CLAUDE_REVIEW_MAX_CHARS: ${{ vars.CLAUDE_REVIEW_MAX_CHARS }}", workflow
         )
+
+
+class AFileWithoutAPatchIsFetchedOrNamed(unittest.TestCase):
+    """GitHub's files API leaves `patch` out of a file whose diff is too large.
+
+    pr_diff() skipped such a file, so nobody reviewed it and nothing named it.
+    Measured on capaz#57: 05-hard-parts.md, 11-data-model.md, 12-architecture.md,
+    13-security-privacy-dr.md and 20-roadmap.md, 300 to 411 changed lines each,
+    came back with no patch, and the posted comment listed only the three files
+    the budget cut. Each such file is now diffed by git from the fetched PR
+    head, or named in the comment and failed. The files API and git are fakes
+    here: no network, no subprocess.
+    """
+
+    PR = "57"
+    BIG = "docs/plan/05-hard-parts.md"
+    PATCHED = {"filename": "CLAUDE.md", "status": "modified", "patch": "@@ -1 +1 @@\n-a\n+b"}
+
+    def setUp(self):
+        # The review job runs this suite with the repo's variables in its
+        # environment, and a set value would override the patched size or cap.
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_REVIEW_")}
+        env.update({"PR_NUMBER": self.PR, "GITHUB_REPOSITORY": "o/r", "GH_TOKEN": "t"})
+        patcher = mock.patch.dict(os.environ, env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.git_calls = []
+
+    @staticmethod
+    def _files_api(files, changed=None):
+        """The opener as GitHub answers: `files` on page 1, then an empty page.
+
+        The PR itself reports `changed` changed files, len(files) by default.
+        """
+        def open_(request, timeout=None):
+            page = re.search(r"/files\?.*[?&]page=(\d+)", request.full_url)
+            if page is None:
+                body = {"changed_files": len(files) if changed is None else changed}
+            else:
+                body = files if page.group(1) == "1" else []
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = json.dumps(body).encode()
+            return response
+
+        return mock.patch.object(claude_review._GITHUB_OPENER, "open", side_effect=open_)
+
+    def _git(self, diffs=None, fail=()):
+        """run_git with no git behind it, recording every call.
+
+        `diffs` maps the last path in a diff's pathspec to git's output for it.
+        `fail` names the subcommands that exit non-zero.
+        """
+        diffs = diffs or {}
+
+        def run_git(args):
+            self.git_calls.append(args)
+            command = "fetch" if "fetch" in args else "diff"
+            if command in fail:
+                raise claude_review.subprocess.CalledProcessError(128, ["git", *args])
+            return "" if command == "fetch" else diffs.get(args[-1], "")
+
+        return mock.patch.object(claude_review, "run_git", side_effect=run_git)
+
+    @staticmethod
+    def _git_diff(path, lines=3):
+        return (
+            f"diff --git a/{path} b/{path}\nindex 1111111..2222222 100644\n"
+            f"--- a/{path}\n+++ b/{path}\n@@ -1,{lines} +1,{lines} @@\n"
+            + "".join(f"+new line {i}\n" for i in range(lines))
+        )
+
+    def _pr_diff(self, files, git):
+        with self._files_api(files), git, contextlib.redirect_stderr(io.StringIO()) as err:
+            diff, unfetched, gap = claude_review.pr_diff()
+        self.assertEqual(gap, ("", ""))
+        return diff, unfetched, err.getvalue()
+
+    def test_a_file_without_a_patch_is_diffed_by_git(self):
+        diff, unfetched, _ = self._pr_diff(
+            [self.PATCHED, {"filename": self.BIG, "status": "modified", "changes": 309}],
+            self._git({self.BIG: self._git_diff(self.BIG)}),
+        )
+        self.assertEqual(unfetched, [])
+        self.assertIn("diff --git a/CLAUDE.md b/CLAUDE.md\n@@ -1 +1 @@", diff)
+        self.assertIn(f"diff --git a/{self.BIG} b/{self.BIG}\n", diff)
+        self.assertIn("+new line 2", diff)
+
+    def test_the_pr_head_is_fetched_as_objects_and_never_checked_out(self):
+        self._pr_diff([{"filename": self.BIG}], self._git({self.BIG: self._git_diff(self.BIG)}))
+        fetch, diff = self.git_calls
+        self.assertIn(f"+refs/pull/{self.PR}/head:{claude_review.PR_HEAD_REF}", fetch)
+        # Three dots: from the merge base, as the files API compares.
+        self.assertIn(f"HEAD...{claude_review.PR_HEAD_REF}", diff)
+        # Git's built-in diff only, whatever a config or attributes file asks for.
+        self.assertIn("--no-ext-diff", diff)
+        self.assertIn("--no-textconv", diff)
+        for call in self.git_calls:
+            for verb in ("checkout", "switch", "restore", "reset", "worktree", "merge", "apply"):
+                with self.subTest(call=call, verb=verb):
+                    self.assertNotIn(verb, call)
+
+    def test_the_fetch_runs_once_however_many_files_need_it(self):
+        names = [f"docs/plan/{n}.md" for n in ("11-data-model", "12-architecture", "20-roadmap")]
+        _, unfetched, _ = self._pr_diff(
+            [{"filename": name} for name in names],
+            self._git({name: self._git_diff(name) for name in names}),
+        )
+        self.assertEqual(unfetched, [])
+        self.assertEqual(sum("fetch" in call for call in self.git_calls), 1)
+
+    def test_a_pr_whose_files_all_carry_patches_runs_no_git(self):
+        diff, unfetched, _ = self._pr_diff([self.PATCHED], self._git())
+        self.assertEqual((unfetched, self.git_calls), ([], []))
+        self.assertIn("CLAUDE.md", diff)
+
+    def test_an_excluded_file_without_a_patch_is_neither_fetched_nor_named(self):
+        diff, unfetched, _ = self._pr_diff(
+            [{"filename": "package-lock.json", "changes": 9000}], self._git()
+        )
+        self.assertEqual((diff, unfetched, self.git_calls), ("", [], []))
+
+    def test_a_rename_diffs_the_old_path_and_the_new(self):
+        new, old = "docs/plan/new.md", "docs/plan/old.md"
+        self._pr_diff(
+            [{"filename": new, "previous_filename": old, "status": "renamed"}],
+            self._git({new: self._git_diff(new)}),
+        )
+        self.assertEqual(self.git_calls[-1][-3:], ["--", old, new])
+
+    def test_a_failed_fetch_names_the_file_instead_of_dropping_it(self):
+        diff, unfetched, err = self._pr_diff(
+            [self.PATCHED, {"filename": self.BIG}], self._git(fail=("fetch",))
+        )
+        self.assertEqual(unfetched, [self.BIG])
+        self.assertIn("CLAUDE.md", diff)
+        self.assertNotIn(self.BIG, diff)
+        self.assertIn(f"pull/{self.PR}/head", err)
+
+    def test_a_pr_number_that_is_not_digits_is_never_fetched(self):
+        # The number goes into the refspec. "５７" is digits to isdigit() and
+        # not ASCII, so it is refused too.
+        for number in ("57;x", "-1", "５７"):
+            with self.subTest(number=number):
+                self.git_calls = []
+                os.environ["PR_NUMBER"] = number
+                diff, unfetched, err = self._pr_diff(
+                    [self.PATCHED, {"filename": self.BIG}], self._git()
+                )
+                self.assertEqual((unfetched, self.git_calls), ([self.BIG], []))
+                self.assertIn("CLAUDE.md", diff)
+                self.assertIn(f"PR_NUMBER={number!r} is not a pull request number", err)
+                status, comment, _ = self._main(
+                    [self.PATCHED, {"filename": self.BIG}], self._git()
+                )
+                self.assertEqual(status, claude_review.STATUS_PARTIAL)
+                self.assertIn(f"`{self.BIG}`", comment)
+                self.assertEqual(self.git_calls, [])
+
+    def test_a_failed_or_empty_git_diff_names_the_file(self):
+        for fail, diffs in ((("diff",), {}), ((), {self.BIG: "\n"})):
+            with self.subTest(fail=fail, diffs=diffs):
+                _, unfetched, _ = self._pr_diff([{"filename": self.BIG}], self._git(diffs, fail))
+                self.assertEqual(unfetched, [self.BIG])
+
+    def test_a_fetched_diff_is_read_in_parts_like_any_other(self):
+        with mock.patch.object(claude_review, "MAX_REVIEW_CHARS", 1000), self._files_api(
+            [self.PATCHED, {"filename": self.BIG}]
+        ), self._git({self.BIG: self._git_diff(self.BIG, lines=200)}):
+            plan = claude_review.review_plan("base", "head")
+        self.assertEqual((plan.files, plan.unfetched), (["CLAUDE.md", self.BIG], []))
+        self.assertGreater(len(plan.chunks), 1)
+        self.assertTrue("".join(plan.chunks).endswith("+new line 199"))
+
+    def test_the_note_names_an_unfetched_file(self):
+        with self._files_api([self.PATCHED, {"filename": self.BIG}]), self._git(
+            fail=("fetch",)
+        ), contextlib.redirect_stderr(io.StringIO()):
+            plan = claude_review.review_plan("base", "head")
+        self.assertEqual((plan.files, plan.unfetched), (["CLAUDE.md"], [self.BIG]))
+        note = claude_review.left_out_note(plan)
+        self.assertIn(
+            "Not reviewed at all, because GitHub sent no patch and git could not"
+            f" produce one: `{self.BIG}`.",
+            note,
+        )
+        # The size is not the cause, so raising it is not the advice.
+        self.assertNotIn("CLAUDE_REVIEW_MAX_CHARS", note)
+
+    def _main(self, files, git):
+        """Run main() over the fakes. Returns the status, the comment and the model calls."""
+        payload = json.dumps({
+            "content": [{"type": "text", "text": "Nothing to flag."}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 20},
+        }).encode()
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = payload
+        response.read.return_value = payload
+        os.environ.update({
+            "ANTHROPIC_API_KEY": "test-key", "REVIEW_SCOPE": "diff",
+            "BASE_SHA": "base", "HEAD_SHA": "head",
+        })
+        os.environ.pop("ANTHROPIC_BASE_URL", None)
+        cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmp, self._files_api(files), git, mock.patch.object(
+            claude_review._NO_REDIRECT_OPENER, "open", return_value=response
+        ) as model, contextlib.redirect_stderr(io.StringIO()):
+            os.chdir(tmp)
+            try:
+                self.assertEqual(claude_review.main(), 0)
+                status = Path(claude_review.REVIEW_STATUS_PATH).read_text(encoding="utf-8")
+                comment = Path("claude-review.md").read_text(encoding="utf-8")
+            finally:
+                os.chdir(cwd)
+        self.sent = [json.loads(call.args[0].data) for call in model.call_args_list]
+        return status.strip(), comment, model.call_count
+
+    def test_a_fetched_file_is_reviewed_and_the_review_is_ok(self):
+        status, comment, calls = self._main(
+            [self.PATCHED, {"filename": self.BIG}], self._git({self.BIG: self._git_diff(self.BIG)})
+        )
+        self.assertEqual((status, calls), (claude_review.STATUS_OK, 1))
+        self.assertNotIn(claude_review.PARTIAL_BANNER, comment)
+
+    def test_an_unfetched_file_fails_the_check_and_the_comment_names_it(self):
+        status, comment, calls = self._main(
+            [self.PATCHED, {"filename": self.BIG}], self._git(fail=("fetch",))
+        )
+        self.assertEqual((status, calls), (claude_review.STATUS_PARTIAL, 1))
+        banner = comment.split("## Claude Code Review\n\n", 1)[1].split("\n\n", 1)[0]
+        self.assertTrue(banner.startswith(claude_review.PARTIAL_BANNER), banner)
+        self.assertIn(f"`{self.BIG}`", banner)
+        self.assertIn("Nothing to flag.", comment)
+        # The model is told too, so it does not review the PR as if complete.
+        self.assertIn(
+            "NOT BY THE AUTHOR. Not reviewed at all, because", json.dumps(self.sent[0])
+        )
+
+    def test_a_pr_of_only_unfetched_files_fails_without_calling_the_model(self):
+        # An empty diff used to mean "Skipped: no reviewable diff", which the
+        # gate passes. Every file left out is a gap, not an empty PR.
+        status, comment, calls = self._main([{"filename": self.BIG}], self._git(fail=("fetch",)))
+        self.assertEqual((status, calls), (claude_review.STATUS_PARTIAL, 0))
+        self.assertNotIn("Skipped", comment)
+        self.assertIn(f"`{self.BIG}`", comment)
+        self.assertFalse(any("--unified=80" in call for call in self.git_calls))
+
+    def test_the_gate_names_every_cause_of_a_partial_review(self):
+        workflow = TheCheckoutFollowsTheBaseBranch._workflow()
+        self.assertIsNotNone(workflow, "claude-review.yml not found beside this test")
+        branch = workflow.split('case "$status" in', 1)[1].split("partial)", 1)[1]
+        branch = branch.split(";;", 1)[0]
+        self.assertIn("could not get a diff for", branch)
+        self.assertIn("3,000-file limit", branch)
+        self.assertNotIn("CLAUDE_REVIEW_MAX_CHARS", branch)
+
+
+class AFileTheFilesAPINeverListedFailsTheCheck(unittest.TestCase):
+    """GitHub's files API lists at most 3,000 files of one PR, then empty pages.
+
+    pr_diff() paged until an empty page, so a file past the limit reached
+    neither the diff, the budget nor the note, and the check could pass. The
+    number it listed is now held against the PR's own `changed_files`. Measured
+    on DefinitelyTyped#67085: 100 files on each of pages 1 to 30, none on page
+    31, and `changed_files` 0, then 27,399 when read again. GitHub is a fake
+    here: no network, no git.
+    """
+
+    PR = "67085"
+    PATCH = "@@ -1 +1 @@\n-a\n+b"
+
+    def setUp(self):
+        # The review job runs this suite with the repo's CLAUDE_REVIEW_MAX_CHARS
+        # in its environment, and a set value would override the default budget.
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_REVIEW_MAX_CHARS"}
+        env.update({"PR_NUMBER": self.PR, "GITHUB_REPOSITORY": "o/r", "GH_TOKEN": "t"})
+        patcher = mock.patch.dict(os.environ, env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # Every file in these fixtures carries a patch, so git never runs.
+        git = mock.patch.object(claude_review, "run_git", side_effect=AssertionError("git ran"))
+        git.start()
+        self.addCleanup(git.stop)
+        self.urls = []
+
+    def _files(self, count):
+        return [
+            {"filename": f"types/p{i}/index.d.ts", "status": "modified", "patch": self.PATCH}
+            for i in range(count)
+        ]
+
+    def _api(self, files, changed):
+        """The opener as GitHub answers: 100 files a page up to the limit, then empty pages.
+
+        The PR request answers {"changed_files": changed}, or `changed` itself
+        when it is a dict, or raises it when it is an exception.
+        """
+        listed = files[: claude_review.FILES_API_LIMIT]
+
+        def open_(request, timeout=None):
+            self.urls.append(request.full_url)
+            page = re.search(r"/files\?.*[?&]page=(\d+)", request.full_url)
+            if page is None:
+                if isinstance(changed, BaseException):
+                    raise changed
+                body = changed if isinstance(changed, dict) else {"changed_files": changed}
+            else:
+                start = (int(page.group(1)) - 1) * 100
+                body = listed[start:start + 100]
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = json.dumps(body).encode()
+            return response
+
+        return mock.patch.object(claude_review._GITHUB_OPENER, "open", side_effect=open_)
+
+    def _pr_diff(self, files, changed):
+        with self._api(files, changed), contextlib.redirect_stderr(io.StringIO()) as err:
+            result = claude_review.pr_diff()
+        self.err = err.getvalue()
+        return result
+
+    def test_a_pr_past_the_limit_says_how_many_files_were_never_listed(self):
+        diff, unfetched, (unlisted, fix) = self._pr_diff(self._files(3412), 3412)
+        self.assertEqual(diff.count("diff --git "), 3000)
+        self.assertEqual(unfetched, [])
+        self.assertIn("lists at most 3,000 files of a PR and this one", unlisted)
+        self.assertIn("this one changes 3,412, so 412 files went unlisted and unreviewed", unlisted)
+        self.assertEqual(fix, "Split the PR.")
+        # The count comes from the PR under review, and paging stops at the
+        # first empty page, which is the one past the limit.
+        self.assertEqual(self.urls[0], f"https://api.github.com/repos/o/r/pulls/{self.PR}")
+        self.assertTrue(self.urls[-1].endswith("&page=31"), self.urls[-1])
+
+    def test_a_count_of_zero_at_the_limit_still_fails(self):
+        # DefinitelyTyped#67085 as GitHub first reported it: 3,000 listed, 0 changed.
+        _, _, (unlisted, fix) = self._pr_diff(self._files(3000), 0)
+        self.assertIn(
+            "lists at most 3,000 files of a PR and stopped there, so any file this one"
+            " changes beyond those went unlisted and unreviewed.",
+            unlisted,
+        )
+        self.assertEqual(fix, "Split the PR.")
+
+    def test_a_list_at_the_limit_fails_even_when_the_count_matches(self):
+        # 3,000 listed is what a PR of 3,000 files and a PR cut at 3,000 both
+        # give, and the count that would tell them apart is the one 67085 got
+        # wrong. A PR of exactly 3,000 files is told to split; none passes unread.
+        _, _, (unlisted, fix) = self._pr_diff(self._files(3000), 3000)
+        self.assertIn(
+            "lists at most 3,000 files of a PR and stopped there, so any file this one"
+            " changes beyond those went unlisted and unreviewed.",
+            unlisted,
+        )
+        self.assertEqual(fix, "Split the PR.")
+
+    def test_a_list_one_short_of_the_limit_that_matches_is_whole(self):
+        self.assertEqual(self._pr_diff(self._files(2999), 2999)[2], ("", ""))
+
+    def test_an_excluded_file_counts_as_listed(self):
+        # changed_files counts every file, so the listed count must as well, or
+        # every PR touching a lockfile would read as a gap.
+        files = self._files(1) + [{"filename": "package-lock.json", "patch": self.PATCH}]
+        diff, _, gap = self._pr_diff(files, 2)
+        self.assertEqual(gap, ("", ""))
+        self.assertNotIn("package-lock.json", diff)
+
+    def test_a_count_that_differs_below_the_limit_asks_for_a_re_run(self):
+        for changed, effect in (
+            (13, "the review may have missed some"),
+            (11, "the reviewed diff may not match the PR as it is now"),
+        ):
+            with self.subTest(changed=changed):
+                _, _, (unlisted, fix) = self._pr_diff(self._files(12), changed)
+                self.assertIn(
+                    f"listed 12 files, but the PR says it changes {changed} files, so {effect}.",
+                    unlisted,
+                )
+                self.assertIn("The PR may have changed", fix)
+
+    def test_no_count_from_github_fails_the_review_and_the_log_says_why(self):
+        # A failed PR request crashed the script before it wrote a status, so
+        # the check went red with no comment. It is now a gap like any other.
+        refused = urllib.error.HTTPError(
+            f"https://api.github.com/repos/o/r/pulls/{self.PR}", 403, "rate limited", {}, None
+        )
+        self.addCleanup(refused.close)
+        for changed, logged in (
+            (refused, f"could not read pull {self.PR}: HTTP Error 403"),
+            (urllib.error.URLError("timed out"), f"could not read pull {self.PR}"),
+            (json.JSONDecodeError("Expecting value", "", 0), f"could not read pull {self.PR}"),
+            ({}, f"GitHub gave no changed_files for pull {self.PR}"),
+            (None, f"GitHub gave no changed_files for pull {self.PR}"),
+        ):
+            with self.subTest(changed=type(changed).__name__):
+                diff, _, (unlisted, fix) = self._pr_diff(self._files(12), changed)
+                self.assertEqual(diff.count("diff --git "), 12)
+                self.assertIn(
+                    "listed 12 files, but GitHub gave no count of the files this PR changes,"
+                    " so the review cannot tell whether it read them all.",
+                    unlisted,
+                )
+                self.assertEqual(fix, "The job log says why; re-run.")
+                self.assertIn(logged, self.err)
+
+    def test_the_note_carries_the_fix_and_the_model_text_does_not(self):
+        with self._api(self._files(12), 13):
+            plan = claude_review.review_plan("base", "head")
+        note = claude_review.left_out_note(plan)
+        self.assertIn("listed 12 files, but the PR says it changes 13 files", note)
+        self.assertIn("re-run", note)
+        # The model reads the fact whether the diff goes in one call or in parts.
+        parts = plan._replace(chunks=plan.chunks * 2)
+        for text in (claude_review._left_out_marker(plan), claude_review._parts_context(parts)):
+            with self.subTest(text=text[:40]):
+                self.assertIn("NOT BY THE AUTHOR. GitHub's files API listed 12 files", text)
+                self.assertNotIn("re-run", text)
+
+    def _main(self, files, changed):
+        """Run main() over the fake. Returns the status, the comment and the model calls."""
+        payload = json.dumps({
+            "content": [{"type": "text", "text": "Nothing to flag."}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 20},
+        }).encode()
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = payload
+        response.read.return_value = payload
+        os.environ.update({
+            "ANTHROPIC_API_KEY": "test-key", "REVIEW_SCOPE": "diff",
+            "BASE_SHA": "base", "HEAD_SHA": "head",
+        })
+        cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmp, self._api(files, changed), mock.patch.object(
+            claude_review._NO_REDIRECT_OPENER, "open", return_value=response
+        ) as model, contextlib.redirect_stderr(io.StringIO()):
+            os.chdir(tmp)
+            try:
+                self.assertEqual(claude_review.main(), 0)
+                status = Path(claude_review.REVIEW_STATUS_PATH).read_text(encoding="utf-8")
+                comment = Path("claude-review.md").read_text(encoding="utf-8")
+            finally:
+                os.chdir(cwd)
+        self.sent = [json.loads(call.args[0].data) for call in model.call_args_list]
+        return status.strip(), comment, model.call_count
+
+    def test_a_short_list_fails_the_check_and_the_comment_says_how_many(self):
+        status, comment, calls = self._main(self._files(12), 13)
+        self.assertEqual((status, calls), (claude_review.STATUS_PARTIAL, 1))
+        banner = comment.split("## Claude Code Review\n\n", 1)[1].split("\n\n", 1)[0]
+        self.assertTrue(banner.startswith(claude_review.PARTIAL_BANNER), banner)
+        self.assertIn("listed 12 files, but the PR says it changes 13 files", banner)
+        self.assertIn("Nothing to flag.", comment)
+        # The coverage count is of the files GitHub listed, and says so.
+        self.assertIn(
+            "- Files: 12 of 12 reviewable changed files GitHub listed. It did not list them all.",
+            comment,
+        )
+        self.assertIn("NOT BY THE AUTHOR. GitHub's files API listed 12", json.dumps(self.sent[0]))
+
+    def test_a_list_of_exactly_the_limit_fails_the_check(self):
+        status, comment, _ = self._main(self._files(3000), 3000)
+        self.assertEqual(status, claude_review.STATUS_PARTIAL)
+        self.assertIn("lists at most 3,000 files of a PR and stopped there", comment)
+        self.assertIn("Split the PR.", comment)
+
+    def test_a_failed_pr_request_still_posts_a_review_that_fails(self):
+        status, comment, calls = self._main(self._files(12), urllib.error.URLError("timed out"))
+        self.assertEqual((status, calls), (claude_review.STATUS_PARTIAL, 1))
+        self.assertIn("GitHub gave no count of the files this PR changes", comment)
+        self.assertIn("The job log says why; re-run.", comment)
+        self.assertIn("Nothing to flag.", comment)
+
+    def test_a_short_list_of_only_excluded_files_fails_without_calling_the_model(self):
+        # An empty diff with nothing left out means "Skipped", which the gate
+        # passes, and the local git diff fallback. Neither may run here.
+        files = [{"filename": "package-lock.json", "patch": self.PATCH}]
+        status, comment, calls = self._main(files, 2)
+        self.assertEqual((status, calls), (claude_review.STATUS_PARTIAL, 0))
+        self.assertNotIn("Skipped", comment)
+        self.assertIn("listed 1 file, but the PR says it changes 2 files", comment)
+
+
+class AOneShotReviewWritesNoCache(unittest.TestCase):
+    """A cache write bills input at 1.25x and pays off only when a later request reads it.
+
+    The single review request marked its diff block cache_control, so every
+    review paid for a write that nothing read: 36 posted reviews across capaz
+    and the kit show every input token as a cache write and a cache read of 0.
+    """
+
+    def test_the_request_carries_no_cache_control(self):
+        sent = []
+
+        def open_(request, timeout=None):
+            sent.append(json.loads(request.data))
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = json.dumps({
+                "content": [{"type": "text", "text": "Nothing to flag."}],
+                "stop_reason": "end_turn",
+            }).encode()
+            return response
+
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "k"}), mock.patch.object(
+            claude_review._NO_REDIRECT_OPENER, "open", side_effect=open_
+        ):
+            os.environ.pop("ANTHROPIC_BASE_URL", None)
+            claude_review.call_claude("diff --git a/x.py b/x.py\n+y = 1")
+        self.assertEqual(len(sent), 1)
+        self.assertNotIn("cache_control", json.dumps(sent[0]))
 
 
 if __name__ == "__main__":
