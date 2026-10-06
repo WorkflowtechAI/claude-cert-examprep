@@ -298,9 +298,10 @@ jobs:
               exit 1
               ;;
             failed)
-              echo "::error::The Claude review did not run: the API returned an error, so no" \
-                   "part of this diff was reviewed. The posted comment carries the status code" \
-                   "and the response body. A spending ceiling on the key and a rate limit both" \
+              echo "::error::The Claude review did not run: the API returned an error or the" \
+                   "reviewer stopped on one it does not handle, so no part of this diff was" \
+                   "reviewed. The posted comment says which, with the status code and response" \
+                   "body for an API error. A spending ceiling on the key and a rate limit both" \
                    "arrive as 429, and the body says which."
               exit 1
               ;;
