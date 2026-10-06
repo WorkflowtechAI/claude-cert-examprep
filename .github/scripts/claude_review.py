@@ -11,6 +11,7 @@ in any bootstrapped repo. Set the REVIEW_PROJECT_NAME env var (the workflow does
 to give the reviewer the repo name; everything else has safe defaults.
 """
 
+import collections
 import fnmatch
 import http.client
 import json
@@ -808,6 +809,15 @@ _CONFIG_FILE = re.compile(
     re.I,
 )
 # Where a file starts: the header of a PR diff and of a codebase snapshot.
+#
+# ONLY A REAL HEADER COUNTS, so a line that merely looks like one cannot move
+# the cursor. A snapshot section is one file, named once at its top, and the
+# file's raw text follows: a `.patch` file or a doc quoting a diff can hold a
+# column-0 `diff --git` line. So in a snapshot only the first header counts.
+# In a diff every content line starts with `+`, `-`, a space or `\`, so none
+# can be a `diff --git` line; but a removed line reading `-- FILE: x ---` (an
+# SQL comment) shows up as `--- FILE: x ---`. So in a diff only `diff --git`
+# headers count. Raised by the Claude review of capaz#114.
 _FILE_START = re.compile(r"^(?:diff --git a/.* b/(.*)|--- FILE: (.*) ---)$", re.M)
 
 
@@ -840,9 +850,14 @@ class _ConfigFileCursor:
     def config_at(self, text: str, index: int) -> bool:
         if text is not self._text:
             self._text = text
+            found = list(_FILE_START.finditer(text))
+            if text.startswith("--- FILE: "):
+                found = found[:1]
+            else:
+                found = [h for h in found if h.group(1) is not None]
             self._headers = [
                 (h.start(), bool(_CONFIG_FILE.search(h.group(1) or h.group(2))))
-                for h in _FILE_START.finditer(text)
+                for h in found
             ]
             self._next, self._pos, self._config = 0, 0, False
         elif index < self._pos:
@@ -870,7 +885,11 @@ def _is_token(piece: str) -> bool:
         return False
     if not (re.search(r"[0-9]", piece) and re.search(r"[A-Za-z]", piece)):
         return False
-    shares = [piece.count(c) / len(piece) for c in set(piece)]
+    # ONE PASS OVER THE PIECE. Counting each distinct character with
+    # `piece.count` scanned the piece once per distinct character, so one long
+    # value with thousands of distinct characters cost their product. Raised by
+    # the Claude review of capaz#114; RedactionIsLinear times the shape.
+    shares = [n / len(piece) for n in collections.Counter(piece).values()]
     return -sum(p * math.log2(p) for p in shares) >= 3.0
 
 

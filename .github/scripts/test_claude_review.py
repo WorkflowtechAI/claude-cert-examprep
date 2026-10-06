@@ -3321,6 +3321,12 @@ class RedactionIsLinear(unittest.TestCase):
             "many keys far below one config header": (
                 "diff --git a/a.yml b/a.yml\n" + "+token: a\n" * 200_000
             ),
+            # The entropy test counted each distinct character with its own scan
+            # of the piece, so one long value with many distinct characters cost
+            # their product: here twenty thousand scans of a megabyte.
+            "one long value with many distinct characters": (
+                "token=a1" + "".join(chr(0x4E00 + i % 20_000) for i in range(1_000_000))
+            ),
             # And with a quote actually open, so the counting runs rather than
             # finding nothing to count.
             "many bare values inside one string": 'f("' + "token=a " * 200_000 + '")',
@@ -3641,6 +3647,38 @@ class CodeUnderASecretNameReachesTheModelAsWritten(unittest.TestCase):
         ):
             with self.subTest(section=section):
                 self.assertEqual(want, claude_review.redact(section))
+
+    def test_only_a_real_file_header_moves_the_cursor(self):
+        # A snapshot section is one file, named once at its top; a header-like
+        # line in its raw text (a .patch file, a doc quoting a diff) is text.
+        for section, want in (
+            (
+                "--- FILE: infra/.env ---\n"
+                "diff --git a/app.py b/app.py\n"
+                "DB_PASSWORD=hunter2\n",
+                "--- FILE: infra/.env ---\n"
+                "diff --git a/app.py b/app.py\n"
+                'DB_PASSWORD="<REDACTED>"\n',
+            ),
+            (
+                "--- FILE: app/db.py ---\n"
+                "--- FILE: infra/.env ---\n"
+                "password = settings_password\n",
+                "--- FILE: app/db.py ---\n"
+                "--- FILE: infra/.env ---\n"
+                "password = settings_password\n",
+            ),
+        ):
+            with self.subTest(section=section):
+                self.assertEqual(want, claude_review.redact(section))
+        # In a diff only `diff --git` is a header. A removed SQL comment that
+        # read `-- FILE: infra/.env ---` shows up as `--- FILE: infra/.env ---`.
+        diff = (
+            "diff --git a/app/db.py b/app/db.py\n"
+            "--- FILE: infra/.env ---\n"
+            "+    password = settings_password\n"
+        )
+        self.assertEqual(diff, claude_review.redact(diff))
 
     def test_the_config_file_list_is_what_it_says(self):
         for path in (
