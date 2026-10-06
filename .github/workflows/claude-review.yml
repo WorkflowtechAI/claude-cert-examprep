@@ -176,7 +176,11 @@ jobs:
       # posted "No review text returned", and passed CI on ~2,048 billed output
       # tokens), so the response-shape handling now has to prove itself on every
       # run. Pure and network-free: no key, no API call, ~0.0s.
+      # The base branch's reviewer, which passed the slow linear-time tests when
+      # it merged; re-timing a megabyte of input on every PR proves nothing new.
       - name: Test the reviewer before reviewing
+        env:
+          REVIEWER_TESTS_SLOW: skip
         run: python .github/scripts/test_claude_review.py
 
       - name: Review with Claude
