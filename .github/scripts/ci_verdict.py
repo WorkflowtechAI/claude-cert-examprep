@@ -87,19 +87,35 @@ def api(repo, token, path):
         sys.exit("::error::GET %s returned %d %s" % (path, e.code, e.reason))
 
 
+def superseded(env, reason):
+    """Not shipping because a newer commit replaced this one.
+
+    At the GATE (no HEAD) that is a quiet stop: the ship job is then SKIPPED,
+    which GitHub shows as neither pass nor fail. In the SHIP job (HEAD given)
+    it is RED. That job already ran, and a green deploy job that shipped
+    nothing reads as "deployed". On 2026-10-06 EGI_bot's deploy of 6771c5d
+    went green in 9 seconds because #125 had moved master while it queued.
+    """
+    if env.get("HEAD"):
+        sys.exit("::error::not deployed: %s. This run shipped nothing; the newer "
+                 "commit's own deploy ships its code." % reason)
+    return False, reason
+
+
 def decide(env, get):
-    """Returns (ship, reason). Exits 1 on a red commit."""
+    """Returns (ship, reason). Exits 1 on a red commit, and in the ship job on a
+    superseded one."""
     sha, branch = env["SHA"], env["BRANCH"]
 
     if env.get("HEAD") and env["HEAD"] != sha:
-        return False, ("checked out %s, not %s: a newer push moved %s, and that "
-                       "push's own CI starts its deploy" % (env["HEAD"][:7], sha[:7], branch))
+        return superseded(env, "checked out %s, not %s: a newer push moved %s"
+                          % (env["HEAD"][:7], sha[:7], branch))
 
     tip = get("git/ref/heads/%s" % branch)["object"]["sha"]
     if tip != sha:
-        return False, ("%s is no longer the tip of %s (now %s); shipping it would roll "
-                       "production back, and the tip's own CI starts its deploy"
-                       % (sha[:7], branch, tip[:7]))
+        return superseded(env, "%s is no longer the tip of %s (now %s); shipping it would "
+                          "roll production back, and the tip's own CI starts its deploy"
+                          % (sha[:7], branch, tip[:7]))
 
     for s in get("commits/%s/status" % sha).get("statuses", []):
         if s.get("context") == STATUS_CONTEXT and s.get("state") == "success":
