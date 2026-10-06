@@ -50,6 +50,7 @@ Writes ship=true|false and reason=... to $GITHUB_OUTPUT when it is set.
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -74,7 +75,7 @@ def api(repo, token, path):
         headers={"Authorization": "Bearer %s" % token,
                  "Accept": "application/vnd.github+json"})
     try:
-        with _OPENER.open(req) as r:
+        with _OPENER.open(req, timeout=30) as r:
             return json.load(r)
     except urllib.error.HTTPError as e:
         # A traceback is what the first deploy printed on a 403, naming neither
@@ -150,8 +151,49 @@ def decide(env, get):
     return True, "%d workflow(s) on %s, newest run of each green" % (len(runs), sha[:7])
 
 
+def post_status(repo, token, sha, state, url):
+    body = json.dumps({"state": state, "context": STATUS_CONTEXT, "target_url": url,
+                       "description": "deploy: %s" % state}).encode()
+    req = urllib.request.Request(
+        "https://api.github.com/repos/%s/statuses/%s" % (repo, sha), data=body, method="POST",
+        headers={"Authorization": "Bearer %s" % token,
+                 "Accept": "application/vnd.github+json"})
+    with _OPENER.open(req, timeout=30) as r:
+        r.read()
+
+
+def record(env, state, post, sleep, attempts=3):
+    """Set deploy/production on SHA. Returns True when it was written.
+
+    A FAILED WRITE IS A WARNING, NOT A FAILED DEPLOY. This runs after the deploy
+    script, so the code is already live; failing the job here would report a
+    release that happened as one that did not. Retried, because the next gate
+    reads this status to avoid shipping twice. Raised in review on
+    gestalt-workframe-edu#617.
+    """
+    for i in range(attempts):
+        try:
+            post(env["REPO"], env["GH_TOKEN"], env["SHA"], state, env.get("URL", ""))
+            print("%s = %s on %s" % (STATUS_CONTEXT, state, env["SHA"][:7]))
+            return True
+        except (urllib.error.URLError, OSError) as e:  # network or HTTP: retried, then reported
+            print("could not record %s (attempt %d of %d): %s" % (STATUS_CONTEXT, i + 1,
+                                                                  attempts, e))
+            if i + 1 < attempts:
+                sleep(5 * (i + 1))
+    print("::warning::%s was not recorded on %s; the deploy itself finished as %s. A later "
+          "gate may ship this commit again." % (STATUS_CONTEXT, env["SHA"][:7], state))
+    return False
+
+
 def main():
     env = dict(os.environ)
+    # `ci_verdict.py --record success|failure`: the deploy job's last step.
+    if len(sys.argv) > 1 and sys.argv[1] == "--record":
+        if len(sys.argv) != 3 or sys.argv[2] not in ("success", "failure"):
+            sys.exit("::error::--record takes one argument, success or failure: %r" % sys.argv[2:])
+        record(env, sys.argv[2], post_status, time.sleep)
+        return
     ship, reason = decide(env, lambda path: api(env["REPO"], env["GH_TOKEN"], path))
     print(("ship: " if ship else "not shipping: ") + reason)
     out = env.get("GITHUB_OUTPUT")
